@@ -3,7 +3,17 @@
 Usage:
     python -m moss_tts_lite "text" -o out.wav [--language X] [--seed 1234]
         [--greedy] [--max-new-tokens 4096] [--device cuda]
+        [--fast] [--fast-native] [--quant TIER]
         [--model-dir DIR] [--config PATH]
+
+Decode paths:
+    (default)      exact eager path; bitwise-parity reference
+    --fast         CUDA-graph path (moss_tts_lite.fast); bitwise-identical
+                   decode to the exact path (M1), ~81 steps/s on W4
+    --fast-native  whole-step CUDA graph tier (moss_tts_lite.fast_native,
+                   arm n2); NOT bitwise -- swaps kernels for kernel-count
+                   reduction, decodes a different-but-valid utterance at
+                   ~97 steps/s on W4 (text argmax 100%, audio top-25 97.5%)
 
 Pipeline: build_tts_prompt -> MossTTSModel -> generate -> 
 delayed_rows_to_segments -> MossCodecDecoder.decode -> soundfile.write
@@ -40,6 +50,7 @@ from .bpe import QwenBPE
 from .codec import MossCodecDecoder, delayed_rows_to_segments
 from .export import is_standalone_dir, load_standalone_model, standalone_presets
 from .fast import FastMossTTS, generate_fast
+from .fast_native import FastNativeTTS, generate_native
 from .gptq import load_gptq_fast
 from .generate import generate
 from .model import MossTTSModel
@@ -86,6 +97,7 @@ _BUILTIN_DEFAULTS = {
     "audio_top_k": 25,
     "audio_repetition_penalty": 1.0,
     "fast": False,
+    "fast_native": False,
     "watchdog": True,
     "watchdog_silence_frames": None,
     "watchdog_max_segment_frames": None,
@@ -185,18 +197,25 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
               device, model_dir, codec_dir, chunk_duration, sampling, resident,
               fast=False, quant=None, w4_group_size=None, watchdog=True,
               watchdog_silence_frames=None, watchdog_max_segment_frames=None,
-              max_requested_pause_s=None, gptq_state=None):
-    """One full pass; returns (wav float32 np, sampling_rate, GenResult).
+              max_requested_pause_s=None, gptq_state=None, fast_native=False):
+    """One full pass; returns (wav float32 np, sampling rate, GenResult).
 
     resident=True  : codec loaded first and kept co-resident during TTS.
     resident=False : TTS -> generate -> free -> codec -> decode.
     fast=True      : CUDA-graph decode path (moss_tts_lite.fast); numerics of the
                      exact path are preserved (M1: bitwise-identical decode).
+    fast_native=True: whole-step CUDA graph tier (moss_tts_lite.fast_native,
+                     arm n2).  NOT bitwise: it swaps kernels (`F.rms_norm`, fused
+                     int4 GEMMs, fused heads) to cut the step's kernel count, so
+                     it decodes a different-but-valid utterance at ~97 steps/s
+                     on W4 (~81 for fast.py); see .tmp/reports/native-1.md.
+                     Incompatible with --greedy (the native loop samples).
     Either way every large object is released in ``finally``.
     """
     dev = torch.device(device)
     model = None
     fast_model = None
+    native = None
     codec = None
     try:
         if resident:
@@ -228,10 +247,27 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
             elif gptq_state:
                 fast_model = load_gptq_fast(model, gptq_state)
             else:
-                fast_model = FastMossTTS(model, quant=quant,
-                                         w4_group_size=w4_group_size)
+                # `w4_group_size=None` must NOT be passed through: it would
+                # override FastMossTTS's own default (128) and trip its
+                # 32/64/128/256 validation, which is what made bare `--fast`
+                # fail with "w4_group_size must be 32/64/128/256" (pre-existing
+                # at bc5415f; only the --quant tiers set it explicitly).
+                _fkw = {} if w4_group_size is None else {"w4_group_size": w4_group_size}
+                fast_model = FastMossTTS(model, quant=quant, **_fkw)
+            if fast_native:
+                # arm n2: whole-step graph + fused kernels; constructed once so
+                # its captured graphs survive across calls in a long-lived
+                # process (one graph is captured per decoded cache length)
+                native = FastNativeTTS(fast_model, arm="n2")
             res = generate_fast(
                 fast_model, prompt,
+                max_new_tokens=max_new_tokens, seed=seed, greedy=greedy, **sampling,
+                stats=stats, watchdog=watchdog,
+                watchdog_silence_frames=watchdog_silence_frames,
+                watchdog_max_segment_frames=watchdog_max_segment_frames,
+                max_requested_pause_s=max_requested_pause_s,
+            ) if not fast_native else generate_native(
+                native, prompt,
                 max_new_tokens=max_new_tokens, seed=seed, greedy=greedy, **sampling,
                 stats=stats, watchdog=watchdog,
                 watchdog_silence_frames=watchdog_silence_frames,
@@ -247,6 +283,8 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
         segments = delayed_rows_to_segments(res.audio_frames)
         del fast_model
         fast_model = None
+        del native
+        native = None
         del model
         model = None
         torch.cuda.empty_cache()
@@ -259,6 +297,8 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
     finally:
         if fast_model is not None:
             del fast_model
+        if native is not None:
+            del native
         if model is not None:
             del model
         if codec is not None:
@@ -272,7 +312,7 @@ def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False
                sampling: dict | None = None, stats: dict | None = None,
                fast=False, quant=None, w4_group_size=None, watchdog=True,
                watchdog_silence_frames=None, watchdog_max_segment_frames=None,
-               gptq_state=None):
+               gptq_state=None, fast_native=False):
     """End-to-end text -> wav.  Returns (wav, sr, res, strategy).
 
     Tries the co-resident strategy (codec + TTS on one card) first and falls
@@ -291,7 +331,8 @@ def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False
                 quant=quant, w4_group_size=w4_group_size, watchdog=watchdog,
                 watchdog_silence_frames=watchdog_silence_frames,
                 watchdog_max_segment_frames=watchdog_max_segment_frames,
-                max_requested_pause_s=max_pause, gptq_state=gptq_state)
+                max_requested_pause_s=max_pause, gptq_state=gptq_state,
+                fast_native=fast_native)
             break
         except torch.cuda.OutOfMemoryError:
             if strategy != "resident":
@@ -322,6 +363,21 @@ def main(argv=None) -> int:
     p.add_argument("--fast", action="store_true",
                    help="CUDA-graph decode path (moss_tts_lite.fast); "
                         "bitwise-identical output, faster steps")
+    p.add_argument("--fast-native", dest="fast_native", action="store_true",
+                   help="whole-step CUDA graph tier (moss_tts_lite.fast_native, "
+                        "arm n2); NOT bitwise -- it swaps kernels (F.rms_norm, "
+                        "fused int4 GEMMs/heads) to cut the step's kernel "
+                        "count and decodes a different-but-valid utterance: "
+                        "text argmax 100%%, audio top-25 97.5%% (W4 baseline "
+                        "75.4%%). WARNING: it needs one graph captured per "
+                        "decoded cache length, so a ONE-SHOT CLI CALL IS "
+                        "SLOWER than --fast (~105 vs ~28 ms/step here: 143 "
+                        "captures for a 144-step utterance). It reaches ~97 "
+                        "steps/s only once the graphs are warm, i.e. in a "
+                        "long-lived process that synthesizes repeatedly "
+                        "(fast.py's sub-graphs are length-independent and so "
+                        "pay this only once). Implies --fast; incompatible "
+                        "with --greedy. Default: off")
     p.add_argument("--quant", default=None,
                    choices=["w4", "w4g32", "w8", "w4gptq", "w4gptq:w1p",
                             "w4gptq:w2", "w4gptq:auto"],
@@ -381,6 +437,16 @@ def main(argv=None) -> int:
         cfg["device"] = args.device
     if args.fast:
         cfg["fast"] = True
+    if args.fast_native:
+        # implies the fast path; the native tier needs the quantized container
+        cfg["fast"] = True
+        cfg["fast_native"] = True
+    if args.fast_native and cfg["greedy"]:
+        # generate_native() samples; greedy would need an argmax path that the
+        # whole-step graph does not implement (the reference's greedy branch is
+        # a different sampling call sequence)
+        raise SystemExit("[moss_tts_lite] --fast-native cannot be combined with "
+                         "--greedy (the native tier samples)")
     # A standalone export is self-describing (meta.json): --quant then only
     # selects *which* preset, and the offline-state resolution below must be
     # skipped (there is no separate state file).
@@ -464,7 +530,8 @@ def main(argv=None) -> int:
         quant=quant, w4_group_size=w4_group, watchdog=cfg["watchdog"],
         gptq_state=gptq_state,
         watchdog_silence_frames=cfg["watchdog_silence_frames"],
-        watchdog_max_segment_frames=cfg["watchdog_max_segment_frames"])
+        watchdog_max_segment_frames=cfg["watchdog_max_segment_frames"],
+        fast_native=bool(cfg.get("fast_native")))
 
     steps = stats.get("steps") or res.n_steps
     step_ms = stats.get("step_ms") or []

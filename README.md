@@ -1,9 +1,17 @@
 # moss-tts-lite — MOSS-TTS-v1.5 最小推理栈（含 CUDA Graph 快速路径与 W4 量化）
 
 `moss_tts_lite` 包是 MOSS-TTS-v1.5（Qwen3-8B 骨干 + MOSS-Audio-Tokenizer 编解码）的极简推理实现：
-预填充 + 逐帧音频解码，输出 24 kHz wav。本包内置两条加速路径：
+预填充 + 逐帧音频解码，输出 24 kHz wav。本包内置三条加速路径：
 
 - **fast bf16**：38 个分段 CUDA 子图 + 静态缓冲（`--fast`），输出与原始 eager 路径**逐位一致**（EXACT）；
+- **fast-native**（`--fast-native`）：整步单图 + 融合算子（`moss_tts_lite.fast_native`，
+  臂 `n2`）。**非逐位一致**：它换掉内核（`F.rms_norm`、融合 int4 GEMM、融合音频头）
+  以削减每步核数，因此解码出另一条同样合法的 utterance。热图下 **~97 步/s**（vs
+  `--fast` 的 ~81），文本 argmax 100%、音频 top-25 97.5%（`--fast` 同口径 75.4%）。
+  ⚠️ **一次性 CLI 调用下它更慢**（实测 105 vs 28 ms/步）：整步图把注意力长度烘进内核，
+  每个新解码长度都要单独 capture（144 步 utterance = 143 次），而 `fast.py` 的子图与
+  长度无关。只有在长驻进程反复合成（图已热）时才有收益。另有 `arm="n1"`：其余逐字复用
+  `fast.py`，与它**逐位一致**（zh 164 / en 190 步文本音频逐行相等），但只快 ~2%；
 - **fast W4**：骨干 36 层 × 7 个 linear 的 int4 group 量化。两套权重来源：
   - **GPTQ 校准量化**（`--quant w4gptq` / `w4gptq:w2`，**推荐**）：用蒸馏语料的分层激活做
     Hessian 校准，含误差补偿与细分组，并按其自身误差排名把最敏感投影/层保 bf16；
@@ -78,6 +86,7 @@ python -m moss_tts_lite "Text here." -o out.wav \
 | `--quant w4`（RTN g128） | **91.5 步/s** | 7.48 GiB | 文本 argmax 100%；音频 top-25 75.4%；runaway 3/12 |
 | `--quant w4g32`（RTN g32） | 84.0 步/s | 8.08 GiB | 文本 argmax 100%；音频 top-25 81.4% |
 | `--quant w8`（显存模式） | 10.7 步/s | 10.51 GiB | 文本 100%；音频 top-25 94.8%（**慢于实时，仅省显存**） |
+| `--fast-native`（W4，**热图**） | **97.1 步/s** | 8.3 GiB | 文本 argmax 100%；音频 top-25 **97.5%**；**非**逐位一致（换内核）；一次性调用更慢（见上） |
 
 速度硬线 ≥78 步/s：W1/W2 均过线（对标 llama.cpp Q8_0 对照档 73.2 步/s 仍更快）。
 gate-2（top-25 成员率）的统计噪声：40 步 × 32 通道，解析 SE ≈ 0.85 个点，
@@ -273,9 +282,14 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \
     python3 -m moss_tts_lite.tests.test_fast_m4
 
+# fast-native：n1 逐位门禁 + n2 质量门 + 三个 bug 回归（见 native-1 报告）
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \
+    python3 -m moss_tts_lite.tests.test_fast_native
+
 # 量化质量全梯度 / int4pack 内核约定黑盒验证（探针脚本在 .tmp/perf_agent/）
 flock .tmp/gpu.lock python3 .tmp/perf_agent/probe_qquality.py
 flock .tmp/gpu.lock python3 .tmp/perf_agent/probe_w4bb.py
 ```
 
-详细性能报告与踩坑记录见 `.tmp/reports/perf-final.md`（及 perf-m1/m3/m4 分报告）。
+详细性能报告与踩坑记录见 `.tmp/reports/perf-final.md`（及 perf-m1/m3/m4 分报告）；
+fast-native 档见 `.tmp/reports/native-1.md`（消融、被否决路线、CLI 冷热图代价）。
