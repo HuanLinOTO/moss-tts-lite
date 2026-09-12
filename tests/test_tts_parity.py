@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..model import (
+from moss_tts_lite.model import (
     AUDIO_END_TOKEN_ID,
     AUDIO_GEN_SLOT_TOKEN_ID,
     AUDIO_PAD_CODE,
@@ -37,13 +37,13 @@ from ..model import (
     PAD_TOKEN_ID,
     MossTTSModel,
 )
-from ..sampling import find_last_equal_C, sample_token
+from moss_tts_lite.sampling import find_last_equal_C, sample_token
 try:  # prefer the real loader (tok-delivered); fall back to the temp mini one
-    from ..st_loader import read_safetensors
+    from moss_tts_lite.st_loader import read_safetensors
 except ImportError:
-    from ._mini_loader import read_safetensors_min as read_safetensors
+    from tests._mini_loader import read_safetensors_min as read_safetensors
 
-ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 
@@ -252,7 +252,7 @@ def phase_b(model, pg, gg):
         mask = pg["attention_mask"][i].cuda()
         gc = next(c for c in gg["cases"] if c["case_name"] == case_name)
         gt = gc["generation_ids"]                   # [T, 33] cpu int64
-        from ..generate import generate
+        from moss_tts_lite.generate import generate
         res = generate(model, {"input_ids": ids, "attention_mask": mask},
                        max_new_tokens=4096, seed=SEED,
                        text_temperature=TEXT_TEMPERATURE, text_top_p=TEXT_TOP_P,

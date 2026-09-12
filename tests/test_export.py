@@ -41,14 +41,14 @@ import tempfile
 
 import torch
 
-from ..export import (FORMAT_TAG, PRESET_METRICS, Q_FILE, export_standalone,
+from moss_tts_lite.export import (FORMAT_TAG, PRESET_METRICS, Q_FILE, export_standalone,
                       is_standalone_dir, read_standalone, render_model_card,
                       standalone_presets, write_safetensors)
-from ..gptq import pack_fast, rtn_quantize
-from ..st_loader import read_safetensors, safetensors_header
+from moss_tts_lite.gptq import pack_fast, rtn_quantize
+from moss_tts_lite.st_loader import read_safetensors, safetensors_header
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-TEMPLATE = os.path.join(REPO, "moss_tts_lite", "README_hf.md")
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))          # lite repo root
+TEMPLATE = os.path.join(REPO, "README_hf.md")
 
 N_LAYERS = 2
 HIDDEN = 256

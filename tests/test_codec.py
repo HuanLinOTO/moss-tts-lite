@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from moss_tts_lite.codec import MossCodecDecoder  # noqa: E402
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-Audio-Tokenizer")
 GOLDEN_WAV = os.path.join(ROOT, ".tmp", "golden", "codec_golden.wav")
 GOLDEN_CODES = os.path.join(ROOT, ".tmp", "golden", "codec_golden_codes.pt")

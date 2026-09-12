@@ -10,12 +10,12 @@ import sys
 
 import torch
 
-from ..model import AUDIO_GEN_SLOT_TOKEN_ID, AUDIO_PAD_CODE, N_VQ, MossTTSModel
+from moss_tts_lite.model import AUDIO_GEN_SLOT_TOKEN_ID, AUDIO_PAD_CODE, N_VQ, MossTTSModel
 try:  # prefer the real loader (tok-delivered); fall back to the temp mini one
-    from ..st_loader import read_safetensors
+    from moss_tts_lite.st_loader import read_safetensors
 except ImportError:
-    from ._mini_loader import read_safetensors_min as read_safetensors
-from ._mini_bpe import build_tts_prompt_dev
+    from tests._mini_loader import read_safetensors_min as read_safetensors
+from tests._mini_bpe import build_tts_prompt_dev
 
 MODEL_DIR = "/root/MOSS-TTS/models/MOSS-TTS-v1.5"
 

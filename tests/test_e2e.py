@@ -21,9 +21,9 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from ..cli import synthesize
+from moss_tts_lite.cli import synthesize
 
-ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.join(os.path.dirname(__file__), ".."))
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 OUT_DIR = os.path.join(ROOT, ".tmp", "tts_agent")
 SR = 24000

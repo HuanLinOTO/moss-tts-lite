@@ -607,8 +607,9 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
                      for name in sorted(copied)}
 
     # ---- model card ------------------------------------------------------
-    tpl = template_path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                        "README_hf.md")
+    tpl = template_path or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "README_hf.md")
     if os.path.isfile(tpl):
         card = render_model_card(open(tpl, encoding="utf-8").read(), meta, preset_name)
         with open(os.path.join(out_dir, README_FILE), "w", encoding="utf-8") as f:

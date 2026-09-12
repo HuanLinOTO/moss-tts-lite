@@ -16,7 +16,7 @@ import os
 import sys
 from pathlib import Path
 
-PKG_ROOT = Path(__file__).resolve().parents[1]          # .../moss_tts_lite
+PKG_ROOT = Path(__file__).resolve().parents[1] / "moss_tts_lite"
 ALLOWED_THIRD_PARTY = {"torch", "numpy", "soundfile", "yaml"}
 
 

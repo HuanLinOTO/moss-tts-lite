@@ -19,7 +19,7 @@ import torch
 from moss_tts_lite.bpe import QwenBPE
 from moss_tts_lite.prompt import build_tts_prompt
 
-ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 

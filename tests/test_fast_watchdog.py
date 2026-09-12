@@ -32,17 +32,17 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from ..model import MossTTSModel
-from ..prompt import build_tts_prompt, build_continuation_prompt
-from ..cli import _max_pause_s
-from ..fast import FastMossTTS, generate_fast
-from ..codec import MossCodecDecoder, delayed_rows_to_segments
+from moss_tts_lite.model import MossTTSModel
+from moss_tts_lite.prompt import build_tts_prompt, build_continuation_prompt
+from moss_tts_lite.cli import _max_pause_s
+from moss_tts_lite.fast import FastMossTTS, generate_fast
+from moss_tts_lite.codec import MossCodecDecoder, delayed_rows_to_segments
 try:
-    from ..st_loader import read_safetensors
+    from moss_tts_lite.st_loader import read_safetensors
 except ImportError:  # pragma: no cover
-    from ._mini_loader import read_safetensors_min as read_safetensors
+    from tests._mini_loader import read_safetensors_min as read_safetensors
 
-ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
 CODEC_DIR = os.path.join(ROOT, "models", "MOSS-Audio-Tokenizer")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")

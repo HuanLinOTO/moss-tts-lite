@@ -7,7 +7,7 @@ Run: python3 -m moss_tts_lite.tests.test_sampling   (CPU only, fast)
 import torch
 import torch.nn.functional as F
 
-from ..sampling import (
+from moss_tts_lite.sampling import (
     apply_repetition_penalty_delay_pattern,
     apply_top_k,
     apply_top_p,

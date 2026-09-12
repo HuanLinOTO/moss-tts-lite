@@ -34,11 +34,11 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from ..fast import FastMossTTS, _LIN_NAMES
-from ..gptq import (SLOT_LINEARS, SLOT_NAMES, CapturingMossTTS, GptqMossTTS,
+from moss_tts_lite.fast import FastMossTTS, _LIN_NAMES
+from moss_tts_lite.gptq import (SLOT_LINEARS, SLOT_NAMES, CapturingMossTTS, GptqMossTTS,
                     damped_cholesky_inverse, effective_weight, gptq_quantize,
                     pack_fast, rtn_quantize, slot_errors)
-from ..model import (AUDIO_PAD_CODE, N_VQ, MossTTSModel, _rms_norm,
+from moss_tts_lite.model import (AUDIO_PAD_CODE, N_VQ, MossTTSModel, _rms_norm,
                      _rotate_half)
 
 DEV = torch.device("cuda")
@@ -268,7 +268,7 @@ def phase_g5_purity():
     print("=== G5: gptq.py dependency purity ===")
     import ast
     from pathlib import Path
-    p = Path(__file__).resolve().parents[1] / "gptq.py"
+    p = Path(__file__).resolve().parents[1] / "moss_tts_lite" / "gptq.py"
     tree = ast.parse(p.read_text(encoding="utf-8"))
     mods = set()
     for node in ast.walk(tree):

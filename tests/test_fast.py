@@ -19,14 +19,14 @@ import sys
 
 import torch
 
-from ..model import MossTTSModel
-from ..fast import FastMossTTS, generate_fast
+from moss_tts_lite.model import MossTTSModel
+from moss_tts_lite.fast import FastMossTTS, generate_fast
 try:
-    from ..st_loader import read_safetensors
+    from moss_tts_lite.st_loader import read_safetensors
 except ImportError:  # pragma: no cover
-    from ._mini_loader import read_safetensors_min as read_safetensors
+    from tests._mini_loader import read_safetensors_min as read_safetensors
 
-ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.join(os.path.dirname(__file__), ".."))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 
@@ -85,7 +85,7 @@ def phase0(model, fast, ids):
 
 
 def _run_case(model, fast, case, label, stats=None):
-    from ..generate import generate
+    from moss_tts_lite.generate import generate
     ids = case["input_ids"].cuda() if "input_ids" in case else case["ids"].cuda()
     # prompt_golden entries: {"input_ids", "attention_mask", "name"}
     mask = case["attention_mask"].cuda() if "attention_mask" in case else None
