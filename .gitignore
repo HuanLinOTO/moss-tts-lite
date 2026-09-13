@@ -5,3 +5,4 @@ __pycache__/
 models/
 *.wav
 .tmp/
+libmoss_native.so
