@@ -66,8 +66,8 @@ GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 #: self-contained directory (7.2 GiB on disk), where the int4 payload is
 #: installed directly.  This test therefore measures BOTH, and the 8 GB
 #: assertions apply to the standalone path.
-STANDALONE = os.environ.get("MOSS_TTS_8GB_DIR", os.path.join(
-    ROOT, ".tmp", "kvfit_agent", "standalone_w1"))
+STANDALONE = os.environ.get("MOSS_TTS_8GB_DIR",
+    "/root/MOSS-TTS/models_export/MOSS-TTS-v1.5-W4GPTQ-w1")
 
 GIB = 2 ** 30
 SEED = 1234
