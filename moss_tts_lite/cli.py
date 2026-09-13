@@ -82,11 +82,26 @@ GPTQ_REGEN_HINT = (
 
 SR = 24000
 
+#: KV-cache sizing (see `.tmp/reports/kvfit-1.md`).
+#: The delay state machine spends extra positions per utterance beyond
+#: `max_new_tokens`: after the last emitted audio row the 32-channel delay ramp
+#: still has to flush (`n_vq` steps), and the audio_end/ramp-out rows add a few
+#: more.  64 covers the measured worst case across zh/en/pause/continuation with
+#: a wide margin (`max_new_tokens` is an upper bound on `n_steps`, so the real
+#: overshoot is bounded by the ramp-out: measured 34 rows for a normal end).
+KV_RAMP_MARGIN = 64
+
+#: default KV-cache size for the *library* entry points (`synthesize`,
+#: `MossTTSModel`); the CLI overrides it with the on-demand size below.
+DEFAULT_MAX_SEQ_LEN = 8192
+
 _BUILTIN_DEFAULTS = {
     "language": None,
     "seed": 1234,
     "greedy": False,
     "max_new_tokens": 4096,
+    "max_seq_len": None,
+    "max_graphs": 64,
     "device": "cuda",
     "chunk_duration": 8.0,
     "text_temperature": 1.5,
@@ -112,6 +127,74 @@ def _max_pause_s(text: str) -> float | None:
     vals = [float(m) for m in _PAUSE_RE.findall(text or "")]
     return max(vals) if vals else None
 
+
+# --------------------------------------------------------------------------- #
+# KV-cache sizing (kvfit).  See `.tmp/reports/kvfit-1.md`.                     #
+# --------------------------------------------------------------------------- #
+def _kv_mib(n_seq: int) -> float:
+    """KV bytes for `n_seq` positions: layers * 2 (K,V) * kv_heads * head_dim * bf16."""
+    return n_seq * 36 * 2 * 8 * 128 * 2 / 2**20
+
+
+def _resolve_max_seq_len(requested: int | None, l0: int, max_new_tokens: int) -> int:
+    """KV positions to allocate: on-demand when `requested` is None.
+
+    On-demand means exactly what this single call needs:
+    ``L0 + max_new_tokens + KV_RAMP_MARGIN`` (see KV_RAMP_MARGIN).  An explicit
+    `requested` is a **lower bound**: the allocation is never smaller than the
+    on-demand size, so a user asking for a huge cache gets it, and a user asking
+    for a smaller one still gets a working run instead of a "prompt exceeds KV
+    cache" error.  The CLI does not expose a way to undersize the cache on
+    purpose (that is what --max-new-tokens is for).
+    """
+    need = max(1, int(l0)) + max(0, int(max_new_tokens)) + KV_RAMP_MARGIN
+    return max(need, int(requested)) if requested else need
+
+
+def _kv_advice(exc: ValueError, l0: int, max_new_tokens: int) -> ValueError:
+    """Re-raise a KV-cache ValueError with an actionable suggestion appended.
+
+    The generation loops raise a bare "prompt L + max_new_tokens N exceeds KV
+    cache S"; on an 8 GB card that is the one error a user can actually fix, so
+    the message names both remedies (and says which one this code path uses).
+    """
+    msg = str(exc)
+    if "KV cache" not in msg and "exceeds" not in msg:
+        return exc
+    return type(exc)(
+        f"{msg}\n[moss_tts_lite] the KV cache is sized on demand "
+        f"(L0={l0} + --max-new-tokens={max_new_tokens} + {KV_RAMP_MARGIN} ramp), "
+        f"so this only happens when the cache was pinned smaller than the run "
+        f"needs. Two ways out:\n"
+        f"  * lower the budget: --max-new-tokens N (1 step ~ 1/12.5 s of audio), or\n"
+        f"  * split the text into segments and synthesize them separately.\n"
+        f"  Raising --max-seq-len does not help by itself -- it is a lower bound, "
+        f"and the on-demand size already follows --max-new-tokens.")
+
+
+def _graph_kwargs(max_graphs: int | None) -> dict:
+    """FastNativeTTS kwargs; `None` keeps the class default (256)."""
+    return {} if max_graphs is None else {"max_graphs": int(max_graphs)}
+
+
+def _oom_advice(exc: torch.cuda.OutOfMemoryError, text: str,
+                max_new_tokens: int) -> torch.cuda.OutOfMemoryError:
+    """Wrap a terminal OOM with the two remedies that actually work here.
+
+    A terminal OOM (both the resident and the sequential strategy failed) on a
+    small card is almost always a generation budget too large for the card, not
+    a broken configuration: the decode peak is weights + graph pool + KV, and of
+    those only the KV half scales with the user's request.  Say so.
+    """
+    return torch.cuda.OutOfMemoryError(
+        f"{exc}\n[moss_tts_lite] both VRAM strategies failed (text {len(text)} chars, "
+        f"--max-new-tokens {max_new_tokens}).\n"
+        f"  * lower the budget: --max-new-tokens N (e.g. 1024 ~ 82 s of audio; "
+        f"1 step ~ 1/12.5 s), or\n"
+        f"  * split the text into segments and synthesize them separately.\n"
+        f"  Auxiliary levers: --fast-native --max-graphs 16 (smaller graph pool), "
+        f"or --quant w4 for the smallest shipped weights (7.48 GiB class).")
+
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 
 
@@ -131,17 +214,20 @@ def _yaml_defaults(path: str | None) -> dict:
     return {k: v for k, v in data.items() if k in _BUILTIN_DEFAULTS}
 
 
-def _load_tts(model_dir: str, dev: torch.device) -> MossTTSModel:
+def _load_tts(model_dir: str, dev: torch.device, max_seq_len: int = 8192) -> MossTTSModel:
     weights = read_safetensors(model_dir)
-    model = MossTTSModel(weights, device=dev, dtype=torch.bfloat16, max_seq_len=8192)
+    model = MossTTSModel(weights, device=dev, dtype=torch.bfloat16,
+                         max_seq_len=max_seq_len)
     del weights
     torch.cuda.empty_cache()
     return model
 
 
-def _load_tts_standalone(model_dir: str, dev: torch.device):
+def _load_tts_standalone(model_dir: str, dev: torch.device,
+                         max_seq_len: int = 8192):
     """Assemble a self-contained quantized export (meta.json; no base ckpt)."""
-    model, fast = load_standalone_model(model_dir, device=dev)
+    model, fast = load_standalone_model(model_dir, device=dev,
+                                        max_seq_len=max_seq_len)
     torch.cuda.empty_cache()
     return model, fast
 
@@ -197,8 +283,9 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
               device, model_dir, codec_dir, chunk_duration, sampling, resident,
               fast=False, quant=None, w4_group_size=None, watchdog=True,
               watchdog_silence_frames=None, watchdog_max_segment_frames=None,
-              max_requested_pause_s=None, gptq_state=None, fast_native=False):
-    """One full pass; returns (wav float32 np, sampling rate, GenResult).
+              max_requested_pause_s=None, gptq_state=None, fast_native=False,
+              max_seq_len=None, max_graphs=None):
+    """One full pass; returns (wav float32 np, sampling rate, GenResult, stats).
 
     resident=True  : codec loaded first and kept co-resident during TTS.
     resident=False : TTS -> generate -> free -> codec -> decode.
@@ -210,6 +297,13 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
                      it decodes a different-but-valid utterance at ~97 steps/s
                      on W4 (~81 for fast.py); see .tmp/reports/native-1.md.
                      Incompatible with --greedy (the native loop samples).
+    max_seq_len    : KV cache positions.  ``None`` (the CLI default) sizes it on
+                     demand: the prompt is built first, L0 is known before the
+                     weights are loaded, and the cache is exactly
+                     ``L0 + max_new_tokens + KV_RAMP_MARGIN``.  An explicit
+                     integer is a *lower bound* (a small request is still rounded
+                     up to the on-demand size, which the run actually needs).
+    max_graphs     : fast_native's whole-step-graph pool cap (see FastNativeTTS).
     Either way every large object is released in ``finally``.
     """
     dev = torch.device(device)
@@ -221,6 +315,11 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
         if resident:
             codec = MossCodecDecoder(codec_dir, device=dev)
         standalone = is_standalone_dir(model_dir)
+        tokenizer = _standalone_tokenizer(model_dir) if standalone else None
+        # ---- prompt first: L0 fixes the on-demand KV size -------------------
+        prompt = build_tts_prompt(text, language=language, tokenizer=tokenizer)
+        want_seq = _resolve_max_seq_len(max_seq_len, int(prompt["input_ids"].shape[1]),
+                                        max_new_tokens)
         if standalone:
             # self-contained quantized export: the int4 payloads AND the
             # tokenizer files live inside the model dir, so nothing is read
@@ -234,12 +333,9 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
                       "export; using the fast/quant decode path",
                       file=sys.stderr)
                 fast = True
-            tokenizer = _standalone_tokenizer(model_dir)
-            model, fast_model = _load_tts_standalone(model_dir, dev)
+            model, fast_model = _load_tts_standalone(model_dir, dev, want_seq)
         else:
-            tokenizer = None
-            model = _load_tts(model_dir, dev)
-        prompt = build_tts_prompt(text, language=language, tokenizer=tokenizer)
+            model = _load_tts(model_dir, dev, want_seq)
         stats: dict = {}
         if fast:
             if standalone:
@@ -258,28 +354,40 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
                 # arm n2: whole-step graph + fused kernels; constructed once so
                 # its captured graphs survive across calls in a long-lived
                 # process (one graph is captured per decoded cache length)
-                native = FastNativeTTS(fast_model, arm="n2")
-            res = generate_fast(
-                fast_model, prompt,
-                max_new_tokens=max_new_tokens, seed=seed, greedy=greedy, **sampling,
-                stats=stats, watchdog=watchdog,
-                watchdog_silence_frames=watchdog_silence_frames,
-                watchdog_max_segment_frames=watchdog_max_segment_frames,
-                max_requested_pause_s=max_requested_pause_s,
-            ) if not fast_native else generate_native(
-                native, prompt,
-                max_new_tokens=max_new_tokens, seed=seed, greedy=greedy, **sampling,
-                stats=stats, watchdog=watchdog,
-                watchdog_silence_frames=watchdog_silence_frames,
-                watchdog_max_segment_frames=watchdog_max_segment_frames,
-                max_requested_pause_s=max_requested_pause_s,
-            )
+                native = FastNativeTTS(fast_model, arm="n2",
+                                       **_graph_kwargs(max_graphs))
+            try:
+                res = generate_fast(
+                    fast_model, prompt,
+                    max_new_tokens=max_new_tokens, seed=seed, greedy=greedy, **sampling,
+                    stats=stats, watchdog=watchdog,
+                    watchdog_silence_frames=watchdog_silence_frames,
+                    watchdog_max_segment_frames=watchdog_max_segment_frames,
+                    max_requested_pause_s=max_requested_pause_s,
+                ) if not fast_native else generate_native(
+                    native, prompt,
+                    max_new_tokens=max_new_tokens, seed=seed, greedy=greedy, **sampling,
+                    stats=stats, watchdog=watchdog,
+                    watchdog_silence_frames=watchdog_silence_frames,
+                    watchdog_max_segment_frames=watchdog_max_segment_frames,
+                    max_requested_pause_s=max_requested_pause_s,
+                )
+            except ValueError as exc:
+                raise _kv_advice(exc, int(prompt["input_ids"].shape[1]),
+                                 max_new_tokens) from None
         else:
             res = generate(
                 model, prompt,
                 max_new_tokens=max_new_tokens, seed=seed, greedy=greedy, **sampling,
                 stats=stats,
             )
+        stats["max_seq_len"] = int(model.max_seq_len)
+        stats["l0"] = int(prompt["input_ids"].shape[1])
+        stats["kv_mib"] = _kv_mib(int(model.max_seq_len))
+        stats["max_graphs"] = (int(native.graph_count())
+                               if native is not None else None)
+        stats["graph_pool_cap"] = (int(native.max_graphs)
+                                   if native is not None else None)
         segments = delayed_rows_to_segments(res.audio_frames)
         del fast_model
         fast_model = None
@@ -312,11 +420,15 @@ def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False
                sampling: dict | None = None, stats: dict | None = None,
                fast=False, quant=None, w4_group_size=None, watchdog=True,
                watchdog_silence_frames=None, watchdog_max_segment_frames=None,
-               gptq_state=None, fast_native=False):
+               gptq_state=None, fast_native=False, max_seq_len=None,
+               max_graphs=None):
     """End-to-end text -> wav.  Returns (wav, sr, res, strategy).
 
     Tries the co-resident strategy (codec + TTS on one card) first and falls
     back to sequential (TTS freed before the codec loads) on CUDA OOM.
+
+    `max_seq_len=None` (the CLI default) sizes the KV cache on demand; see
+    `_resolve_max_seq_len`.  `max_graphs=None` keeps FastNativeTTS's own default.
     """
     sampling = {k: v for k, v in sampling.items() if v is not None} if sampling else {}
     max_pause = _max_pause_s(text)
@@ -332,11 +444,12 @@ def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False
                 watchdog_silence_frames=watchdog_silence_frames,
                 watchdog_max_segment_frames=watchdog_max_segment_frames,
                 max_requested_pause_s=max_pause, gptq_state=gptq_state,
-                fast_native=fast_native)
+                fast_native=fast_native, max_seq_len=max_seq_len,
+                max_graphs=max_graphs)
             break
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as exc:
             if strategy != "resident":
-                raise
+                raise _oom_advice(exc, text, max_new_tokens) from None
             print("[moss_tts_lite] CUDA OOM with codec co-resident; "
                   "retrying with sequential load (TTS freed before codec)",
                   file=sys.stderr)
@@ -359,6 +472,22 @@ def main(argv=None) -> int:
                    help="argmax decoding instead of seeded sampling")
     p.add_argument("--max-new-tokens", type=int, default=None,
                    help="generation step budget (default 4096)")
+    p.add_argument("--max-seq-len", type=int, default=None, metavar="N",
+                   help="KV cache size in positions. Default: on demand = "
+                        "L0 + --max-new-tokens + 64 (L0 is the prompt length, "
+                        "known after tokenization; ~0.14 MiB per position). "
+                        "An explicit N is a LOWER BOUND: the cache is never "
+                        "smaller than the run needs, so raising it only matters "
+                        "if you also raise --max-new-tokens. Use it to pin a "
+                        "known cache size (e.g. a server reusing one process)")
+    p.add_argument("--max-graphs", type=int, default=None, metavar="N",
+                   help="--fast-native's whole-step graph pool cap (default 64; "
+                        ".tmp/reports/kvfit-1.md). One graph per decoded cache "
+                        "length, ~6-7.5 MiB each; beyond the cap the oldest is "
+                        "evicted and re-captured (~40-80 ms), so a one-shot CLI "
+                        "call is unaffected (it captures every length once "
+                        "anyway) while a long utterance in a long-lived process "
+                        "degrades if N is too small")
     p.add_argument("--device", default=None, help="'cuda' (default) or 'cpu'")
     p.add_argument("--fast", action="store_true",
                    help="CUDA-graph decode path (moss_tts_lite.fast); "
@@ -433,6 +562,10 @@ def main(argv=None) -> int:
         cfg["greedy"] = True
     if args.max_new_tokens is not None:
         cfg["max_new_tokens"] = args.max_new_tokens
+    if args.max_seq_len is not None:
+        cfg["max_seq_len"] = args.max_seq_len
+    if args.max_graphs is not None:
+        cfg["max_graphs"] = args.max_graphs
     if args.device is not None:
         cfg["device"] = args.device
     if args.fast:
@@ -531,16 +664,28 @@ def main(argv=None) -> int:
         gptq_state=gptq_state,
         watchdog_silence_frames=cfg["watchdog_silence_frames"],
         watchdog_max_segment_frames=cfg["watchdog_max_segment_frames"],
-        fast_native=bool(cfg.get("fast_native")))
+        fast_native=bool(cfg.get("fast_native")),
+        max_seq_len=cfg.get("max_seq_len"),
+        max_graphs=cfg.get("max_graphs"))
 
     steps = stats.get("steps") or res.n_steps
     step_ms = stats.get("step_ms") or []
     avg = sum(step_ms) / len(step_ms) if step_ms else float("nan")
+    graphs = stats.get("max_graphs")
     print(f"[moss_tts_lite] wrote {args.output}: {len(wav)} samples "
           f"({len(wav) / sr:.2f}s @ {sr} Hz), steps={res.n_steps}, "
           f"finished={res.finished}, vram_strategy={strategy}, "
           f"prefill={stats.get('prefill_ms', float('nan')):.0f}ms, "
           f"decode avg={avg:.1f}ms/step ({1000 / avg:.1f} steps/s)")
+    print(f"[moss_tts_lite] KV: L0={stats.get('l0')} + "
+          f"--max-new-tokens={cfg['max_new_tokens']} + {KV_RAMP_MARGIN} ramp "
+          f"-> max_seq_len={stats.get('max_seq_len')} "
+          f"({stats.get('kv_mib', float('nan')):.0f} MiB"
+          + (f", user floor {cfg['max_seq_len']}" if cfg.get("max_seq_len") else "")
+          + ")")
+    if graphs is not None:
+        print(f"[moss_tts_lite] native graphs: {graphs} captured "
+              f"(cap {stats.get('graph_pool_cap')})")
     if getattr(res, "watchdog_triggered", False):
         ws = getattr(res, "watchdog_stats", {})
         print(f"[moss_tts_lite] WARNING: production watchdog triggered "

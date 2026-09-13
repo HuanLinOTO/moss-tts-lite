@@ -132,19 +132,62 @@ class MossTTSModel:
         ].contiguous()  # [2, hidden]
 
         # rope tables (computed fp32 like HF, cast to model dtype)
-        inv = 1.0 / (ROPE_THETA ** (
-            torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=dev) / self.head_dim))
-        pos = torch.arange(max_seq_len, device=dev, dtype=torch.float32)
-        freqs = torch.outer(pos, inv)
-        emb2 = torch.cat((freqs, freqs), dim=-1)
-        self.rope_cos = emb2.cos().to(dtype)  # [max_seq, head_dim]
-        self.rope_sin = emb2.sin().to(dtype)
+        self.rope_cos, self.rope_sin = self._rope_tables(max_seq_len, dev, dtype,
+                                                         self.head_dim)
 
         # static KV cache: [n_layers, n_kv, max_seq, head_dim] for K and V
         self.k_cache = torch.zeros(self.n_layers, self.n_kv_heads, max_seq_len,
                                    self.head_dim, dtype=dtype, device=dev)
         self.v_cache = torch.zeros_like(self.k_cache)
         self._seq = 0
+
+    @staticmethod
+    def _rope_tables(n: int, dev: torch.device, dtype: torch.dtype,
+                     head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """rope cos/sin for `n` positions (the original fp32 chain, verbatim).
+
+        Every entry depends on its own position only, so `table[:m]` for m <= n
+        is bitwise-identical to a table built with n == m -- which is what lets
+        `ensure_seq_len` resize without moving a single decoded value.
+        """
+        inv = 1.0 / (ROPE_THETA ** (
+            torch.arange(0, head_dim, 2, dtype=torch.float32, device=dev) / head_dim))
+        pos = torch.arange(n, device=dev, dtype=torch.float32)
+        freqs = torch.outer(pos, inv)
+        emb2 = torch.cat((freqs, freqs), dim=-1)
+        return emb2.cos().to(dtype), emb2.sin().to(dtype)  # [n, head_dim] each
+
+    def ensure_seq_len(self, n: int) -> int:
+        """Grow the KV cache + rope tables so `n` positions fit; returns the size.
+
+        Only growth is possible (tensors can never shrink without reallocating
+        1.1 GiB at max_seq_len, and the caller owns the budget), and only the
+        tail of the cache is zeroed: slots below the current sequence are the
+        live KV state of an in-flight utterance and must not be touched.
+
+        Value-preserving by construction: an unchanged `n` is a no-op, and a
+        grown rope table reproduces the old table element-for-element.
+        """
+        n = int(n)
+        if n <= self.max_seq_len:
+            return self.max_seq_len
+        if self._seq > self.max_seq_len:
+            raise RuntimeError(f"live sequence {self._seq} exceeds cache "
+                               f"{self.max_seq_len}; cannot grow")
+        old = self.max_seq_len
+        dev, dtype = self.device, self.dtype
+        ck = torch.zeros(self.n_layers, self.n_kv_heads, n, self.head_dim,
+                         dtype=dtype, device=dev)
+        cv = torch.zeros_like(ck)
+        ck[:, :, :old].copy_(self.k_cache)
+        cv[:, :, :old].copy_(self.v_cache)
+        cos, sin = self._rope_tables(n, dev, dtype, self.head_dim)
+        cos[:old].copy_(self.rope_cos)
+        sin[:old].copy_(self.rope_sin)
+        self.k_cache, self.v_cache = ck, cv
+        self.rope_cos, self.rope_sin = cos, sin
+        self.max_seq_len = n
+        return n
 
     # ------------------------------------------------------------------ utils
     @property

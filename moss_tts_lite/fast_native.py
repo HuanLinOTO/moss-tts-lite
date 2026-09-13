@@ -183,19 +183,27 @@ class FastNativeTTS:
     uses it for).
     """
 
-    def __init__(self, base: FastMossTTS, arm: str = "n2", max_graphs: int = 256):
+    def __init__(self, base: FastMossTTS, arm: str = "n2", max_graphs: int = 64):
         """Args:
             max_graphs: cap on captured graphs.  Each whole-step graph costs
                 ~6-7.5 MiB of device memory in the shared graph pool (the ~1000
                 kernel nodes' parameters and work descriptors; their activations
                 sum to under 1 MiB), so the cap is a memory/latency tradeoff:
-                one graph is captured per decoded length, 256 covers ~20 s of
-                audio, and beyond the cap the least recently used graph is
-                dropped and re-captured on demand (~40-80 ms each, which is why
-                a trajectory much longer than the cap degrades badly -- the
-                cache thrashes).  Measured reachable ceilings on a 24 GiB card:
-                256 graphs is comfortable, 400 fits, 1200 raises a capture-time
-                CUDA OOM on top of the 8.3 GiB of weights.
+                one graph is captured per decoded length, and beyond the cap the
+                least recently used graph is dropped and re-captured on demand
+                (~40-80 ms each, which is why a trajectory much longer than the
+                cap degrades badly -- the cache thrashes).
+
+                Default 64 (~0.5 GiB of pool): a one-shot CLI call captures
+                every length exactly once anyway, so the cap only bounds what
+                stays resident, and 64 covers a 5 s utterance before the first
+                re-capture.  Measured on the w1p path
+                (`.tmp/reports/kvfit-1.md` §3): 256 -> 64 changes neither the
+                per-step cost of the first capture-sweep nor the re-capture
+                cost once the cap is exceeded (both are the same
+                `_capture()`), it only lowers the resident pool.  Raise it
+                (e.g. 256, ~2 GiB) in a long-lived server that synthesizes
+                repeatedly and wants the graphs to stay warm.
         """
         if arm not in ARMS:
             raise ValueError(f"unknown arm {arm!r} (expected one of {sorted(ARMS)})")

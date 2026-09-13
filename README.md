@@ -69,11 +69,45 @@ python -m moss_tts_lite "Text here." -o out.wav \
     --seed 1234 \             # 采样种子（缺省随机）
     --greedy \                # 贪心（argmax）解码，替代种子采样
     --max-new-tokens 2000 \   # 解码步数上限（缺省 4096）
+    --max-seq-len N \         # KV 缓存位置数下限（缺省：按需，见下）
+    --max-graphs N \          # --fast-native 图池上限（缺省 64）
     --device cuda             # 'cuda'（缺省）或 'cpu'（cpu 不支持 fast/quant）
 ```
 
 注意：`--quant` 会**自动启用** `--fast`（量化只在 fast 路径上生效），终端会打印一行提示；
 单独 `--quant` 不再会出现"被静默忽略、实际跑 eager"的组合。
+
+## KV 缓存：按需分配（`--max-seq-len` 语义）
+
+KV 缓存是除权重之外最大的一块显存（每位置 36 层 × 2(K,V) × 8 头 × 128 维 × bf16
+= **0.1406 MiB**，8192 位置 = 1.125 GiB）。旧版本无条件按 8192 分配，即使一次 12 字的
+合成只用 130 个位置。现在 **CLI 默认按需分配**：
+
+```
+max_seq_len = L0 + --max-new-tokens + 64
+```
+
+- `L0` 是**实际 prompt 长度**（分词后才知道，所以 cli.py 先 build prompt 再装权重）；
+- `+64` 是 delay 状态机的收尾余量：`max_new_tokens` 是步数上限，但最后一次音频行之后
+  32 通道的 ramp 还要冲完（`n_vq` 步）+ audio_end 行（实测正常收尾 34 行）；
+- **`--max-seq-len N` 是下限**：不会小于实际所需，也不会因为给了一个更大的值而变小
+  （用户给大就尊重用户）。想减显存请调 `--max-new-tokens`，不是 `--max-seq-len`。
+
+实测（w1p，seed 1234）：
+
+| 输入 | L0 | max_new | max_seq_len | KV |
+|---|---:|---:|---:|---:|
+| 12 字中文 | 66 | 4096 | 4226 | 0.566 GiB |
+| 英文短句 | 71 | 4096 | 4231 | 0.567 GiB |
+| `[pause 8s]` 文本 | 80 | 4096 | 4240 | 0.568 GiB |
+| ~150 字长文 | 134 | 4096 | 4294 | 0.575 GiB |
+| continuation（120 帧前缀） | 185 | 4096 | 4345 | 0.582 GiB |
+| （旧版固定） | — | — | 8192 | 1.125 GiB |
+
+**数值路径零改动**：KV 尺寸只改缓冲区大小，不改任何算子。证明（同 seed 同文本，
+8192 与按需两种尺寸下逐位比较）：zh/en/pause/长文四种输入的 text 与 audio 全轨迹
+`torch.equal` = True，步数完全相同（`tests/test_vram_budget.py` Phase 0/1,
+`.tmp/reports/kvfit-1.md` §5）。
 
 ## 路径对照表（A10G-24G / torch 2.9.1 实测；其他卡等比参考）
 
@@ -81,14 +115,16 @@ python -m moss_tts_lite "Text here." -o out.wav \
 |---|---|---|---|---|
 | eager bf16 | 29.7 步/s | ~17 GiB | 0.42 | 数值基准 |
 | `--fast`（bf16） | **36.0 步/s** | 16.98 GiB | 0.22 | **EXACT 逐位一致**（zh/en 全轨迹 0 翻转） |
-| `--quant w4gptq`（W1p，**默认量化档**） | **81.6 步/s** | 8.28 GiB | 文本 argmax 100%；十语言 pooled cover **99.52%**（tie-robust，最低语言格 99.12）；golden top-25 98.64%；runaway **0/12** |
-| `--quant w4gptq:w2`（W2，质量档） | 78.5 步/s | 8.53 GiB | 文本 argmax 100%；音频 top-25 **91.25%**（CUDA topk 口径）/ **99.30%**（tie-robust）；多语言 +0.545 pt、情感 +1.020 pt；runaway **0/12** |
+| `--quant w4gptq`（W1p，**默认量化档**） | **81.6 步/s** | 8.28 GiB → **7.22 GiB**（按需 KV） | 文本 argmax 100%；十语言 pooled cover **99.52%**（tie-robust，最低语言格 99.12）；golden top-25 98.64%；runaway **0/12** |
+| `--quant w4gptq:w2`（W2，质量档） | 78.5 步/s | 8.53 GiB → **7.47 GiB**（按需 KV） | 文本 argmax 100%；音频 top-25 **91.25%**（CUDA topk 口径）/ **99.30%**（tie-robust）；多语言 +0.545 pt、情感 +1.020 pt；runaway **0/12** |
 | `--quant w4`（RTN g128） | **91.5 步/s** | 7.48 GiB | 文本 argmax 100%；音频 top-25 75.4%；runaway 3/12 |
 | `--quant w4g32`（RTN g32） | 84.0 步/s | 8.08 GiB | 文本 argmax 100%；音频 top-25 81.4% |
 | `--quant w8`（显存模式） | 10.7 步/s | 10.51 GiB | 文本 100%；音频 top-25 94.8%（**慢于实时，仅省显存**） |
 | `--fast-native`（W4，**热图**） | **97.1 步/s** | 8.3 GiB | 文本 argmax 100%；音频 top-25 **97.5%**；**非**逐位一致（换内核）；一次性调用更慢（见上） |
 
 速度硬线 ≥78 步/s：W1/W2 均过线（对标 llama.cpp Q8_0 对照档 73.2 步/s 仍更快）。
+表内「VRAM(峰值)」一列：`→` 右侧是**按需 KV**（本节标题下）下的实测峰值；左侧是
+历史文献值（当时固定 8192 位置 + 图池口径不同），保留作对照。
 gate-2（top-25 成员率）的统计噪声：40 步 × 32 通道，解析 SE ≈ 0.85 个点，
 bootstrap 95% CI ≈ ±3 个点 —— W1 与 W2 在统计上不可区分，**选档依据应是速度取舍**。
 
@@ -261,8 +297,33 @@ bf16 清单/基座 sha256）、分词器与 config 全套、模型卡 `README.md
 1. 依赖同上；W4 路径要求 **CUDA ≥12.0 构建 + sm_80（Ampere）及以上**，否则报
    "not available for build"。【未实测：Windows 轮子安装】
 2. 显存选档：24GB→`--fast`；16GB→`--fast`（紧）或 `--quant w4`；12GB→`--quant w4`；
-   8GB→`--quant w4` 依赖 CLI 的 OOM 自动回退（TTS 与 codec 分时占用），不建议
-   codec 同卡常驻。
+   **8GB→`--quant w4gptq`（w1p GPTQ 质量档 + 按需 KV + standalone 导出，实测 ~7.9 GiB，
+   其他档见下表）**。旧版 8GB 档只能选 `--quant w4`（RTN g128，质量最低档）并依赖 CLI 的
+   OOM 自动回退（TTS 与 codec 分时占用）；按需 KV（本节下方）把 KV 从 1.125 GiB 降到约
+   0.57 GiB、`--max-graphs` 默认 64 再把图池从 2.11 GiB 降到 0.51 GiB，两者合计腾出
+   ~2.1 GiB，8GB 卡因此不再需要牺牲质量。
+
+   下表为 A10G-24G 上实测（8 GB 卡等价配额：torch 限在 `8.0 − CUDA context`，
+   判据取 **nvidia-smi 进程峰值 ≤ 8.0 GiB**），按需 KV，**必须用 standalone 导出的
+   `--model-dir`**——`base + w1p.pt` 装配要先驻留 16.6 GiB bf16，8GB 卡无论如何都过不去：
+
+   | 档位 | 8GB 卡实测（smi 峰值） | 可用的 `--max-new-tokens` | 8GB 可跑？ |
+   |---|---|---|---|
+   | `--quant w4gptq`（w1p，**质量档，默认**） | **7.80–7.96 GiB** | ≤ **2048**（~164 s 音频）| ✅ 推荐 |
+   | `--quant w4gptq:w2`（质量档） | 7.92–8.03 GiB | ≤ **768** | ⚠️ 仅微幅可用（余量 10 MiB）|
+   | `--quant w4`（RTN g128） | ~6.7 GiB | 宽松 | ✅ 但质量最低（top-25 75.4%）|
+   | `--quant w8` / bf16 | — | — | ❌（权重就装不下）|
+
+   **注意这仍是 ~7.9 GiB 的运行，不是 7.2–7.4 GiB**：w1p 权重地板实测 **7.115 GiB**
+   （int4 载荷 3.955 + bf16 `v_proj` 0.281 + `emb_tokens`/`head_text` 2.376 +
+   `head_audio`/`emb_ext` 0.500），加上 CUDA context 0.285 与 fast.py 图池 0.076，
+   **KV 之外就已经 7.48 GiB**——8 GB 卡只剩 ~0.35 GiB 给 KV。
+   实测方法、边界扫掠与全部数字见 `.tmp/reports/kvfit-1.md` §4。
+
+   8GB 卡上的两个关键旋钮：**`--max-new-tokens`**（唯一能降 KV 的手段；默认 4096 会 OOM，
+   超限报错会直接给出应降到多少或建议分段）与 **`--max-graphs`**（默认 64；设 256 会多占
+   1.56 GiB 图池）。codec 与 TTS 分时驻留（`vram_strategy=sequential`），这是 8GB 卡唯一
+   可行的策略。
 3. CUDA graph：本实现为 38 个分段子图（共享 memory pool + 独立 capture stream，
    捕获前 warmup 3 次）；**不要**把注意力卷进子图（会破坏 EXACT）。Windows WDDM 下
    capture 支持但首次更慢【未实测】。
