@@ -23,7 +23,8 @@
 ## 安装
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu128   # torch >= 2.9, CUDA 12.x 构建
+pip install torch --index-url https://download.pytorch.org/whl/cu128   # torch >= 2.5（量化档需 >= 2.5：`_convert_weight_to_int4pack`
+                                              # 的 uint8 半字节格式自 2.5 起；2.4 仅支持 bf16 eager 路径，实测与 2.9 轨迹逐位一致）
 pip install numpy soundfile pyyaml
 ```
 
