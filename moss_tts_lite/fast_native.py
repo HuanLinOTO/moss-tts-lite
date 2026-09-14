@@ -1,67 +1,24 @@
 """Native-operator fast decode for MOSS-TTS (whole-step CUDA graph, W4).
 
-Measured on an A10G-24G with the shipped w1p checkpoint, zh_plain, seed 1234,
-audio-phase step at a fixed cache length:
+`FastNativeTTS` decodes with a single whole-step CUDA graph per cache length
+and a reduced kernel count (fused GEMMs/heads, ``F.rms_norm``, table-gather
+rope): ~98 steps/s on an A10G vs fast.py's ~82.  It is NOT bitwise to the
+reference (argmax 100%, top-25 gate agreement >= 97.5%); use the default
+fast.py path when exact reproduction matters.
 
-    path                          ms/step   steps/s   text argmax  top-25 cover
-    fast.py (38 sub-graphs)        12.23      81.7       100.00%      75.39%
-    n1 whole-step graph            12.01      83.3       100.00%      98.91%
-    n2 + fused GEMMs/norm/heads    10.21      97.9       100.00%      97.50%
+Design constraints that must not be violated when editing this module:
 
-`n1` is *bitwise-identical* to `fast.py`: verified over 40 teacher-forced rows in
-both phases (`lt_buf`, `two_buf`, `la_buf` all max|d| = 0), across the
-`gqa_max_len` attention-mode switch (0/36 mismatches at len 691-726), and its
-generated utterance is row-for-row equal for all 164 steps.  It is only 2% faster, because
-the step is GPU-bound at ~1080 kernels and merging graph launches does not
-remove kernels.  `n2` buys the real 16% via kernel-count cuts; the cost is that
-its forward is no longer bitwise (the `F.rms_norm` swap alone moves audio logits
-by 0.5), so it decodes a *different* but equally valid utterance, and its
-top-25 gate agreement (97.50%) still clears the >=95% hard gate that the
-unmodified W4 path **fails** at 75.39%.
+- Attention keeps fast.py's exact-length call inside the graph; one graph per
+  cache length (`bucket_for` records why padded/bucketed alternatives were
+  measured and rejected); `max_graphs` bounds the graph cache.
+- Sampling stays OUTSIDE the graph (fast.py's exact call sequence, RNG stream
+  preserved); arm n3 moved it in and was rejected -- the channel-supset draw
+  order made trajectories run away.  See `ARMS["n3"]`.
+- `_rms_norm` is kept in `prefill`, where a per-step difference compounds
+  into a different utterance.
 
-What this module does
----------------------
-1. **Whole-step CUDA graph.**  `fast.py` keeps attention eager and splits each
-   step into 38 sub-graphs, because a padded/masked SDPA dispatches to a
-   different kernel than the exact-length call its bitwise gate demands.  Here
-   embedding + all 36 layers incl. attention + all heads (and, in n3, the FSM
-   and sampling) are one graph, so a step is a single replay.  Attention keeps
-   `fast.py`'s exact-length call; since that length is fixed inside a graph, one
-   graph is captured per cache length.  `bucket_for` documents why every
-   padded/bucketed alternative was measured and rejected, and `max_graphs`
-   bounds the resulting graph cache.
-
-2. **Kernel-count reduction (where the milliseconds actually are).**  The 32
-   audio heads become one `[32*1025, 4096]` GEMM, the audio-phase text rows one
-   `[2, 4096]` GEMM, `(q,k)` and `(gate,up)` become single int4 GEMMs over
-   concatenated payloads (bitwise-neutral: concatenating output rows leaves each
-   row's K accumulation untouched), the 33 embedding gathers become one gather
-   plus one reduction, the 6-op `_rms_norm` fp32 chain becomes `F.rms_norm`, and
-   rope becomes one table gather (`_rms_norm` is only kept in `prefill`, where a
-   per-step difference compounds into a different utterance).  Step kernels drop
-   from ~2346 to ~1080.
-
-3. **Tensorized delay FSM + in-graph sampling (arm n3) -- NOT recommended.**
-   Kept for reference only: drawing all 32 channels every step (vs the
-   reference's channel-subset draws) changes the RNG stream, and on this model
-   that makes the trajectory run away (zh 3170 steps, en non-terminating), so it
-   is both wrong and slow.  See the note at `ARMS["n3"]`.
-
-Three bugs were found and fixed while building this; all three are pinned by
-`tests/test_fast.py` phase C and verified to bite by mutation.  The
-"audio rows diverged from step 1" and "en ran 1766 steps" symptoms both had the
-*same* cause -- `replay()` publishing only `two_buf` in the audio phase, so
-audio tokens were sampled from `model.audio_logits()` on the prefill hidden
-state -- and both are fixed by taking `la_step` unconditionally.  The third
-(`not is_stopping` guards in `text_decision`, below) is a real deviation from
-the reference but is *not* observable as a step count on these prompts; it is
-pinned as a differential table instead.
-
-Not pursued (measured and left alone): the int4 GEMMs are 7.16 of the ~10 ms and
-run at ~423 GB/s of the A10G's ~600 GB/s, so the remaining headroom is memory
-bandwidth, not launch overhead -- the activations sum to under 1 MiB and the
-cost of removing whole blocks (attention 0.46 ms, KV write 0.17 ms, q/k norms
-0.12 ms) is only 0.70 ms in total.
+Measured numbers, the n1/n2/n3 ablation, and the bug history live in
+docs/design/fast-native.md.
 """
 
 from __future__ import annotations
