@@ -81,12 +81,11 @@ def test_help_renders() -> None:
     assert "--eager" in usage and "--fast" in usage and "--fast-native" in usage
     # Each flag's help is anchored to its own option line (argparse prints
     # "--flag<spaces>help..."), which normalizes to "--flag help...".
-    assert "--fast NO-OP (fast is already the default since v1.1.0)" in text, text[:200]
-    assert "--eager reference slow path, for debugging" in text, text[:200]
-    assert ("--fast-native whole-step CUDA graph tier "
-            "(moss_tts_lite.fast_native, arm n2): FASTER than the default") in text
-    assert "NOT bitwise-identical" in text
-    print("  A: --help renders; usage lists --eager; --fast says NO-OP; "
+    assert "--fast no-op: fast is the default" in text, text[:200]
+    assert "--eager eager reference path" in text, text[:200]
+    assert "--fast-native faster than the default" in text
+    assert "not bitwise-identical" in text
+    print("  A: --help renders; usage lists --eager; --fast says no-op; "
           "--fast-native says 'faster, not bitwise' -> PASS")
 
 

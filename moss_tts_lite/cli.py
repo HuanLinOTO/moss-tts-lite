@@ -1,48 +1,10 @@
-"""Command-line entry point: text -> TTS -> MOSS-Audio codec -> 24 kHz wav.
+"""CLI: text -> TTS -> codec -> 24 kHz wav.
 
-Usage:
-    python -m moss_tts_lite "text" -o out.wav [--language X] [--seed 1234]
-        [--greedy] [--max-new-tokens 4096] [--device cuda]
-        [--eager] [--fast] [--fast-native] [--quant TIER]
-        [--model-dir DIR] [--config PATH]
-
-Decode paths:
-    (default)      fast CUDA-graph path (moss_tts_lite.fast); bitwise-identical
-                   decode to the eager reference (M1), ~36 steps/s on bf16 and
-                   ~82 on the shipped W4 GPTQ tiers.  There is NOTHING to pass:
-                   the fast path is what a bare command line runs.
-    --fast         no-op alias for the default (kept so existing scripts and
-                   docs keep working); prints a one-line note and changes
-                   nothing.
-    --fast-native  whole-step CUDA graph tier (moss_tts_lite.fast_native,
-                   arm n2); NOT bitwise -- swaps kernels for kernel-count
-                   reduction, decodes a different-but-valid utterance at
-                   ~97 steps/s on W4 (text argmax 100%, audio top-25 97.5%).
-                   Faster than the default; read the --help entry before using
-                   it for a one-shot call (per-length graph capture is not
-                   amortized there).
-    --eager        reference slow path: plain MossTTSModel.step decoding with no
-                   CUDA graphs (~30 steps/s bf16).  Debugging / parity work
-                   only; it is NOT the default anymore.
-
-Pipeline: build_tts_prompt -> MossTTSModel -> generate -> 
-delayed_rows_to_segments -> MossCodecDecoder.decode -> soundfile.write
-(24 kHz mono, float32).
-
-Dependencies: torch / numpy / soundfile / pyyaml + stdlib only.
-
-Optional YAML defaults are read from ``moss_tts_lite/config.yaml`` next to the
-package when it exists (keys: language, seed, greedy, max_new_tokens, device,
-chunk_duration, text_temperature, text_top_p, text_top_k, audio_temperature,
-audio_top_p, audio_top_k, audio_repetition_penalty).  Precedence:
-command line > YAML > built-ins.  A missing file or missing pyyaml simply
-falls back to built-ins.
-
-VRAM strategy (A10G-24G: TTS bf16 peak ~17 GiB + codec fp32 ~3.6 GiB):
-    resident   load the codec FIRST, then TTS, keep both co-resident
-               (~20.6 GiB peak) — the default;
-    sequential on CUDA OOM, retry: TTS -> generate -> free TTS -> codec ->
-               decode (~17 GiB peak).  The strategy actually used is printed.
+Pipeline: build_tts_prompt -> MossTTSModel -> generate ->
+delayed_rows_to_segments -> MossCodecDecoder.decode -> soundfile.write.
+Decode path: fast (default, bitwise) / --fast-native (faster, not bitwise) /
+--eager (reference). Precedence: CLI > moss_tts_lite/config.yaml > built-ins.
+VRAM: codec+TTS co-resident by default; on CUDA OOM, sequential retry.
 """
 
 from __future__ import annotations
@@ -335,9 +297,7 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
                 _fkw = {} if w4_group_size is None else {"w4_group_size": w4_group_size}
                 fast_model = FastMossTTS(model, quant=quant, **_fkw)
             if fast_native:
-                # arm n2: whole-step graph + fused kernels; constructed once so
-                # its captured graphs survive across calls in a long-lived
-                # process (one graph is captured per decoded cache length)
+                # built once: per-length graphs must survive across calls
                 native = FastNativeTTS(fast_model, arm="n2",
                                        **_graph_kwargs(max_graphs))
             try:
@@ -479,78 +439,34 @@ def main(argv=None) -> int:
                         "anyway) while a long utterance in a long-lived process "
                         "degrades if N is too small")
     p.add_argument("--device", default=None,
-                   help="'cuda' (default) or 'cpu'. The cpu path is the eager "
-                        "reference (no CUDA graphs) and does not support "
-                        "quantization")
+                   help="'cuda' (default) or 'cpu' (eager only, no "
+                        "quantization)")
     p.add_argument("--fast", dest="fast", action="store_true",
-                   help="NO-OP (fast is already the default since v1.1.0): kept "
-                        "so existing scripts and docs keep working. Accepting "
-                        "it changes nothing and prints a one-line note. The "
-                        "default path is the CUDA-graph decoder "
-                        "(moss_tts_lite.fast), bitwise-identical to the eager "
-                        "reference; use --eager for that reference itself, or "
-                        "--fast-native for the faster non-bitwise tier")
+                   help="no-op: fast is the default (kept for compatibility)")
     p.add_argument("--eager", dest="eager", action="store_true",
-                   help="reference slow path, for debugging: plain eager "
-                        "MossTTSModel.step decoding (no CUDA graphs, ~30 "
-                        "steps/s on bf16). NOT bitwise-different from the "
-                        "default (the default is bitwise-identical to it), just "
-                        "slower -- use it to reproduce pre-v1.1.0 CLI "
-                        "behaviour or to bisect the fast path")
+                   help="eager reference path (slow; debugging only)")
     p.add_argument("--fast-native", dest="fast_native", action="store_true",
-                   help="whole-step CUDA graph tier (moss_tts_lite.fast_native, "
-                        "arm n2): FASTER than the default (~97 vs ~82 steps/s "
-                        "on W4) and NOT bitwise-identical -- it swaps kernels "
-                        "(F.rms_norm, "
-                        "fused int4 GEMMs/heads) to cut the step's kernel "
-                        "count and decodes a different-but-valid utterance: "
-                        "text argmax 100%%, audio top-25 97.5%% (W4 baseline "
-                        "75.4%%). WARNING: it needs one graph captured per "
-                        "decoded cache length, so a ONE-SHOT CLI CALL IS "
-                        "SLOWER than --fast (~105 vs ~28 ms/step here: 143 "
-                        "captures for a 144-step utterance). It reaches ~97 "
-                        "steps/s only once the graphs are warm, i.e. in a "
-                        "long-lived process that synthesizes repeatedly "
-                        "(fast.py's sub-graphs are length-independent and so "
-                        "pay this only once). Implies --fast; incompatible "
-                        "with --greedy. Default: off")
+                   help="faster than the default (~97 vs ~82 steps/s on W4) "
+                        "but not bitwise-identical; per-length graph capture "
+                        "makes one-shot calls slower -- best in a long-lived "
+                        "process. Incompatible with --greedy")
     p.add_argument("--quant", default=None,
                    choices=["w4", "w4g32", "w8", "w4gptq", "w4gptq:w1p",
                             "w4gptq:w2", "w4gptq:auto"],
-                   help="weight quantization (only exists on the fast path; "
-                        "implied since fast is the default). GPTQ tiers "
-                        "(calibration-quantized, offline state): 'w4gptq' = "
-                        "W1, the default tier (~8.3 GiB, ~81 steps/s, audio "
-                        "top-25 89.30%% [CUDA topk] / 98.32%% [tie-robust], "
-                        "runaway 0/12); 'w4gptq:w2' = W2 quality tier (~8.5 GiB, "
-                        "~78 steps/s, top-25 91.25%% [CUDA topk] / 99.30%% "
-                        "[tie-robust], 0/12); 'w4gptq:w1p' = W1p (same shape and "
-                        "speed class as W1, quantized against the ten-language "
-                        "calibration v3) - the "
-                        "top-25 figure depends on the "
-                        "tie convention, see README_ADVANCED.md; "
-                        "'w4gptq:auto' = cached state if present, else fall "
-                        "back to 'w4' with a notice. Non-GPTQ tiers: 'w4' = "
-                        "RTN int4 group-128 (perf-m4 semantics; ~7.4 GiB, ~91 "
-                        "steps/s, top-25 75.4%%, runaway 3/12), 'w4g32' = RTN "
-                        "int4 group-32 (~8.1 GiB, ~84 steps/s), 'w8' = int8 "
-                        "per-channel (memory-saving, slow decode); default: "
-                        "bf16")
+                   help="weight quantization tier: w4gptq (W4 GPTQ, default "
+                        "tier w1p), w4gptq:w2 (quality tier), w4gptq:auto "
+                        "(cached state else w4), w4 (RTN g128), w4g32, w8 "
+                        "(int8); default bf16")
     p.add_argument("--gptq-state", default=None, metavar="PATH",
-                   help="offline GPTQ state file for --quant w4gptq* (needs a "
-                        "sibling <PATH>.meta.json). Overrides "
-                        "$MOSS_TTS_GPTQ_DIR and <model_dir>/gptq/")
+                   help="offline GPTQ state file for w4gptq* (overrides "
+                        "$MOSS_TTS_GPTQ_DIR and <model_dir>/gptq/)")
     p.add_argument("--no-watchdog", dest="watchdog", action="store_false",
-                   help="disable the runaway-generation watchdog (default: on; "
-                        "forces an audio end after ~5.1 s of consecutive "
-                        "low-energy frames or an over-long segment)")
+                   help="disable the runaway-generation watchdog (default: on)")
     p.add_argument("--watchdog-silence-frames", type=int, default=None,
-                   help="override the watchdog's consecutive-low-energy "
-                        "threshold (default: auto = 64 frames, raised to cover "
-                        "[pause Xs] markers in the text)")
+                   help="watchdog consecutive-low-energy frame threshold "
+                        "(default: auto)")
     p.add_argument("--watchdog-max-segment-frames", type=int, default=None,
-                   help="override the watchdog's per-segment length floor "
-                        "(default: auto = 640 frames)")
+                   help="watchdog per-segment length floor (default: auto)")
     p.add_argument("--model-dir", default=None,
                    help="MOSS-TTS-v1.5 checkpoint directory")
     p.add_argument("--codec-dir", default=None,
@@ -707,8 +623,6 @@ def main(argv=None) -> int:
     step_ms = stats.get("step_ms") or []
     avg = sum(step_ms) / len(step_ms) if step_ms else float("nan")
     graphs = stats.get("max_graphs")
-    # which decoder actually ran (v1.1.0 flipped the default to fast, so the
-    # summary names it explicitly instead of leaving it to be inferred)
     if cfg.get("fast_native"):
         path = "fast-native(n2,native-graphs)"
     elif cfg["fast"]:
