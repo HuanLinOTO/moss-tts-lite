@@ -1,13 +1,15 @@
 # moss-tts-lite — MOSS-TTS-v1.5 最小推理栈（含 CUDA Graph 快速路径与 W4 量化）
 
 `moss_tts_lite` 包是 MOSS-TTS-v1.5（Qwen3-8B 骨干 + MOSS-Audio-Tokenizer 编解码）的极简推理实现：
-预填充 + 逐帧音频解码，输出 24 kHz wav。本包内置三条加速路径：
+预填充 + 逐帧音频解码，输出 24 kHz wav。本包内置三条加速路径（**第一条是默认**）：
 
-- **fast bf16**：38 个分段 CUDA 子图 + 静态缓冲（`--fast`），输出与原始 eager 路径**逐位一致**（EXACT）；
+- **默认 = fast bf16**：38 个分段 CUDA 子图 + 静态缓冲（`moss_tts_lite.fast`），输出与
+  原始 eager 路径**逐位一致**（EXACT）。自 v1.1.0 起裸命令行就走它，`--fast` 只是保留的
+  no-op 别名（兼容旧脚本/文档）；
 - **fast-native**（`--fast-native`）：整步单图 + 融合算子（`moss_tts_lite.fast_native`，
   臂 `n2`）。**非逐位一致**：它换掉内核（`F.rms_norm`、融合 int4 GEMM、融合音频头）
   以削减每步核数，因此解码出另一条同样合法的 utterance。热图下 **~97 步/s**（vs
-  `--fast` 的 ~81），文本 argmax 100%、音频 top-25 97.5%（`--fast` 同口径 75.4%）。
+  默认 fast 的 ~81），文本 argmax 100%、音频 top-25 97.5%（fast 同口径 75.4%）。
   ⚠️ **一次性 CLI 调用下它更慢**（实测 105 vs 28 ms/步）：整步图把注意力长度烘进内核，
   每个新解码长度都要单独 capture（144 步 utterance = 143 次），而 `fast.py` 的子图与
   长度无关。只有在长驻进程反复合成（图已热）时才有收益。另有 `arm="n1"`：其余逐字复用
@@ -20,11 +22,32 @@
   GPTQ 档同时修掉了 RTN 的非终止近静音 runaway 缺陷（verdict-1 §五）：
   同 12 个种子下 GPTQ **0/12**，RTN **3/12**。
 
+## CLI 默认行为（v1.1.0 行为翻转）
+
+v1.1.0 之前 CLI 默认跑 **eager**（`MossTTSModel.step` 的朴素实现），`--fast` 是可选的
+图化路径。两者输出**逐位相同**（M1 验收），eager 只是更慢，所以“可选”只意味着默认
+慢了 20%。现在默认就是 fast，标志语义如下：
+
+| 标志 | 行为 | 说明 |
+|---|---|---|
+| （无） | fast（CUDA graph，逐位一致） | **默认**，bf16 36 步/s；W4 GPTQ 82 步/s |
+| `--fast` | 同上，**no-op** | 仅兼容已写脚本/文档；接受时在 stderr 打印 `[--fast is now the default; this flag is a no-op]` |
+| `--fast-native` | fast_native（arm n2，整步图 + 融合算子） | **比默认更快**（W4 97 vs 82 步/s），但**非逐位一致**；与 `--greedy` 不兼容 |
+| `--eager` | eager 参照路径 | 仅调试/复现旧默认；“reference slow path, for debugging”；与 `--quant`、`--fast-native` 互斥 |
+| `--quant TIER` | fast + 量化 | 量化只存在于 fast 路径；fast 已是默认，因此**不再打印** “--quant implies --fast”（已无意义） |
+
+API 层不受影响：`synthesize(..., fast=...)`、`generate()`、`MossTTSModel.step` 都保留，
+只有 `synthesize` / `_pipeline` 的 `fast` 默认值随 CLI 一起从 `False` 变成 `True`。
+直接调用 eager 原语的测试（如 `tests/test_parity.py` 的 golden 轨迹）不经过默认值，
+仍逐位可复现；需要显式 eager 的调用方写 `fast=False`。回归门禁见 `tests/test_cli.py`
+（phase A help 渲染 / phase B 标志矩阵，无 GPU / phase C 三路径 GPU 冒烟）。
+
 ## 安装
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu128   # torch >= 2.5（量化档需 >= 2.5：`_convert_weight_to_int4pack`
                                               # 的 uint8 半字节格式自 2.5 起；2.4 仅支持 bf16 eager 路径，实测与 2.9 轨迹逐位一致）
+                                              # 纯 CPU（--device cpu）没有 CUDA graph，CLI 自动回退到 eager
 pip install numpy soundfile pyyaml
 ```
 
@@ -41,11 +64,14 @@ pip install numpy soundfile pyyaml
 入口是**包级模块**：`python -m moss_tts_lite`（不是 `python -m moss_tts_lite.cli`——cli.py 自身无 `__main__` 块）。
 
 ```bash
-# 1) 原始 eager 路径（基准，无需 CUDA graph）
-python -m moss_tts_lite "你好，欢迎收听。" -o out_eager.wav
+# 1) 默认：fast bf16，与 eager 逐位一致（EXACT），36 步/s，需 ~17 GiB
+python -m moss_tts_lite "你好，欢迎收听。" -o out_fast.wav
 
-# 2) fast bf16：与 eager 逐位一致（EXACT），36 步/s，需 ~17 GiB
+# 1b) 旧脚本里的 --fast 仍可用：no-op 别名（打印一行提示，不改变行为）
 python -m moss_tts_lite "你好，欢迎收听。" -o out_fast.wav --fast
+
+# 1c) eager 参照路径（慢，仅调试/复现旧版默认行为）
+python -m moss_tts_lite "你好，欢迎收听。" -o out_eager.wav --eager
 
 # 3) GPTQ-W4 默认档（W1：g32 + v_proj 保 bf16）：~81 步/s，~8.3 GiB
 python -m moss_tts_lite "你好，欢迎收听。" -o out_w4gptq.wav --quant w4gptq
@@ -72,11 +98,13 @@ python -m moss_tts_lite "Text here." -o out.wav \
     --max-new-tokens 2000 \   # 解码步数上限（缺省 4096）
     --max-seq-len N \         # KV 缓存位置数下限（缺省：按需，见下）
     --max-graphs N \          # --fast-native 图池上限（缺省 64）
-    --device cuda             # 'cuda'（缺省）或 'cpu'（cpu 不支持 fast/quant）
+    --device cuda             # 'cuda'（缺省）或 'cpu'（cpu 不支持 fast/quant，自动回退 eager）
+    --eager \                 # 慢参照路径（仅调试；与 --quant/--fast-native 互斥）
 ```
 
-注意：`--quant` 会**自动启用** `--fast`（量化只在 fast 路径上生效），终端会打印一行提示；
-单独 `--quant` 不再会出现"被静默忽略、实际跑 eager"的组合。
+注意：**fast 是默认路径**（v1.1.0 行为翻转，见下），`--quant` 只选择量化档位、不再
+“启用”任何东西，因此没有多余提示行；`--fast` 保留为 no-op 别名；`--eager` 才回到慢的
+参照路径（与 `--quant` / `--fast-native` 互斥，量化只存在于 fast 路径上）。
 
 ## KV 缓存：按需分配（`--max-seq-len` 语义）
 
@@ -114,14 +142,17 @@ max_seq_len = L0 + --max-new-tokens + 64
 
 | 路径 | 速度 | VRAM(峰值) | RTF | 保真 |
 |---|---|---|---|---|
-| eager bf16 | 29.7 步/s | ~17 GiB | 0.42 | 数值基准 |
-| `--fast`（bf16） | **36.0 步/s** | 16.98 GiB | 0.22 | **EXACT 逐位一致**（zh/en 全轨迹 0 翻转） |
+| **默认**（= `--fast`，bf16） | **36.0 步/s** | 16.98 GiB | 0.22 | **EXACT 逐位一致**（zh/en 全轨迹 0 翻转） |
 | `--quant w4gptq`（W1p，**默认量化档**） | **81.6 步/s** | 8.28 GiB → **7.22 GiB**（按需 KV） | 文本 argmax 100%；十语言 pooled cover **99.52%**（tie-robust，最低语言格 99.12）；golden top-25 98.64%；runaway **0/12** |
 | `--quant w4gptq:w2`（W2，质量档） | 78.5 步/s | 8.53 GiB → **7.47 GiB**（按需 KV） | 文本 argmax 100%；音频 top-25 **91.25%**（CUDA topk 口径）/ **99.30%**（tie-robust）；多语言 +0.545 pt、情感 +1.020 pt；runaway **0/12** |
 | `--quant w4`（RTN g128） | **91.5 步/s** | 7.48 GiB | 文本 argmax 100%；音频 top-25 75.4%；runaway 3/12 |
 | `--quant w4g32`（RTN g32） | 84.0 步/s | 8.08 GiB | 文本 argmax 100%；音频 top-25 81.4% |
 | `--quant w8`（显存模式） | 10.7 步/s | 10.51 GiB | 文本 100%；音频 top-25 94.8%（**慢于实时，仅省显存**） |
 | `--fast-native`（W4，**热图**） | **97.1 步/s** | 8.3 GiB | 文本 argmax 100%；音频 top-25 **97.5%**；**非**逐位一致（换内核）；一次性调用更慢（见上） |
+| `--eager`（bf16，仅调试） | 29.7 步/s | ~17 GiB | 与默认**逐位相同**（默认就是它的图化形式） |
+
+上表 `--eager` 一行是默认路径的数值基准：CUDA graph 回放不引入任何数值偏差，所以两行
+的产出逐位相同，区别只有速度。
 
 速度硬线 ≥78 步/s：W1/W2 均过线（对标 llama.cpp Q8_0 对照档 73.2 步/s 仍更快）。
 表内「VRAM(峰值)」一列：`→` 右侧是**按需 KV**（本节标题下）下的实测峰值；左侧是
@@ -133,7 +164,7 @@ RTF = 合成 1 秒音频所需解码秒数（越小越好）。每步解码产�
 
 ## 质量权衡说明（读这一段再选档）
 
-- **EXACT 的含义**：`--fast` 的 bf16 路径与原始 eager 路径**逐位相同**（CUDA graph 回放
+- **EXACT 的含义**：默认（fast）的 bf16 路径与原始 eager 路径**逐位相同**（CUDA graph 回放
   不引入任何数值偏差；注意力保持图外精确长度）。要求可复现/可审计选它。
 - **GPTQ 档与 RTN 档的区别**：RTN 逐组四舍五入到 int4；GPTQ 用校准激活的 Hessian 做
   逐列误差补偿（列块 128 惰性更新 + 阻尼 Cholesky 逆），再对固定码本做闭合解的
@@ -148,7 +179,7 @@ RTF = 合成 1 秒音频所需解码秒数（越小越好）。每步解码产�
   top-25 内，对齐实际采样的 top_k=25）：g128 为 75.4%，g32 为 81.4%。
 - **最终裁决是听感**：实际生成用种子采样（temperature/top_p/top_k），不是 argmax；
   E2E 结构（收尾、时长、非 pad 码占比）与 golden 高度接近。建议用同一段文本分别在
-  `--fast`、`--quant w4gptq`、`--quant w4gptq:w2` 下生成，A/B 试听后再定档。
+  `--fast-native`、`--quant w4gptq`、`--quant w4gptq:w2` 下生成，A/B 试听后再定档。
   速度优先选 `w4gptq`（W1p，81.6 步/s，99.52%），分布保真优先选 `w4gptq:w2`（W2，tie-robust 99.74%）。
   速度余量很窄：W2 距 78 步/s 硬底线仅约 0.6%，再加 bf16 保护项前必须先重测速度。
 - `--quant w8` 不推荐用于加速：本栈（torch 2.9.1/A10G）的 `_weight_int8pack_mm` 无
@@ -250,8 +281,8 @@ python -m moss_tts_lite "Hello, this is a test." -o out_en.wav --language Englis
 行为说明：
 
 - 目录内含 `meta.json` 即走独立装配（`moss_tts_lite.export.load_standalone_model`），
-  并自动启用 fast/quant 解码（终端会打印一行提示）；**非**独立目录的 `--model-dir`
-  路径语义完全不变。
+  并按内置档位走 fast/quant 解码（终端会打印一行提示指明用的是哪个档位）；**非**独立目录的
+  `--model-dir` 路径语义完全不变（默认 fast，bf16）。
 - 独立目录自带分词器文件，不会去读 `models/MOSS-TTS-v1.5/`。
 - `--quant w4gptq[:w2]` 可与独立目录同时给出，**仅作档位校验**：档位不符会硬错误
   并列出可用档位（无静默换档）。
@@ -297,7 +328,7 @@ bf16 清单/基座 sha256）、分词器与 config 全套、模型卡 `README.md
 
 1. 依赖同上；W4 路径要求 **CUDA ≥12.0 构建 + sm_80（Ampere）及以上**，否则报
    "not available for build"。【未实测：Windows 轮子安装】
-2. 显存选档：24GB→`--fast`；16GB→`--fast`（紧）或 `--quant w4`；12GB→`--quant w4`；
+2. 显存选档：默认即 fast（bf16，24GB 卡）；16GB→默认 fast（紧）或 `--quant w4`；12GB→`--quant w4`；
    **8GB→`--quant w4gptq`（w1p GPTQ 质量档 + 按需 KV + standalone 导出，实测 ~7.9 GiB，
    其他档见下表）**。旧版 8GB 档只能选 `--quant w4`（RTN g128，质量最低档）并依赖 CLI 的
    OOM 自动回退（TTS 与 codec 分时占用）；按需 KV（本节下方）把 KV 从 1.125 GiB 降到约
@@ -336,7 +367,10 @@ bf16 清单/基座 sha256）、分词器与 config 全套、模型卡 `README.md
 ## 复现测试（GPU；Linux 开发环境命令，Windows 下去掉 flock 部分）
 
 ```bash
-# 合并后的测试套件按类别分 8 个文件（详见 tests/test_*.py 的模块 docstring）。
+# 合并后的测试套件按类别分 9 个文件（详见 tests/test_*.py 的模块 docstring）。
+# CLI 默认翻转（v1.1.0）：help 渲染 + 标志矩阵（无 GPU）+ 三路径冒烟（GPU）
+PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_cli.py
+
 # M1 + fast-native：phase0 bitwise + zh/en 全轨迹 EXACT + 速度，
 #                  n1 逐位门禁 + n2 质量门 + 三个 bug 回归（见 native-1 报告）
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \

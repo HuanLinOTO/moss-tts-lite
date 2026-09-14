@@ -32,7 +32,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install moss-tts-lite
 ```
 
-> torch 2.4 及以下仅支持 bf16 eager 路径（量化档需 2.5+，实测跨版本轨迹一致）。
+> torch 2.4 及以下仅支持 bf16 eager 路径（量化档需 2.5+，实测跨版本轨迹一致）；
+> 图化 fast 路径需 CUDA，纯 CPU 下（`--device cpu`）CLI 会自动回退到 eager。
 
 ## 模型权重（三选一）
 
@@ -68,6 +69,10 @@ moss-tts-lite "文本" -o out.wav --model-dir ./W4GPTQ-w1 --fast-native
 moss-tts-lite "文本" -o out.wav --model-dir ./W4GPTQ-w1 --seed 1234
 ```
 
+> **默认就是快路径**（v1.1.0 起）：裸命令行直接走 CUDA Graph 解码（`moss_tts_lite.fast`），
+> 与 eager 参照**逐位一致**。旧脚本里的 `--fast` 仍被接受，但已是 no-op（打印一行提示）。
+> 要跑慢的 eager 参照路径请显式加 `--eager`（仅调试用）。
+
 Python API：
 
 ```python
@@ -78,6 +83,7 @@ wav, sr, res, strategy = synthesize(
     model_dir="./W4GPTQ-w1",   # standalone 目录
     quant="w4gptq",             # 或 None=bf16（需原版权重）
     seed=1234,
+    # fast=True 是默认（与 CLI 一致）；只有显式 fast=False 才是 eager 参照路径
 )
 ```
 
@@ -85,13 +91,18 @@ wav, sr, res, strategy = synthesize(
 
 | 命令 | 速度* | 显存 | 质量 | bitwise |
 |---|---|---|---|---|
-| （默认 bf16） | 36 步/s | ~17GB | 参照 | ✅ |
+| **（默认，等价于 `--fast`）** | **36 步/s** | ~17GB | 参照 | ✅ |
 | `--quant w4gptq` | 82 步/s | 8.5GB / **8GB 卡可用** | top-25 98.6%（tie-robust） | ❌ 量化档 |
 | `--quant w4gptq` + `--fast-native` | 97 步/s | 8.2GB | argmax 100% / top-25 97.5% | ❌ |
+| `--eager`（仅调试） | 30 步/s | ~17GB | 与默认**逐位相同** | ✅ |
 
 *A10G 实测；4090 约按带宽等比提升。
 
 8GB 卡注意：加 `--max-new-tokens 2048`（约 164 秒音频容量），详见 `--help`。
+
+三路径的关系：默认 `fast`（逐位一致）、`--fast-native`（更快，非逐位）、`--eager`（慢参照）。
+**eager 路径本体仍保留在 API 层**——直接调用 `moss_tts_lite.generate` / `MossTTSModel.step`
+的代码不受本次默认翻转影响，只是 CLI 不再默认走它。
 
 ## 常见问题
 

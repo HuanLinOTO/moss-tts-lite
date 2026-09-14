@@ -3,17 +3,27 @@
 Usage:
     python -m moss_tts_lite "text" -o out.wav [--language X] [--seed 1234]
         [--greedy] [--max-new-tokens 4096] [--device cuda]
-        [--fast] [--fast-native] [--quant TIER]
+        [--eager] [--fast] [--fast-native] [--quant TIER]
         [--model-dir DIR] [--config PATH]
 
 Decode paths:
-    (default)      exact eager path; bitwise-parity reference
-    --fast         CUDA-graph path (moss_tts_lite.fast); bitwise-identical
-                   decode to the exact path (M1), ~81 steps/s on W4
+    (default)      fast CUDA-graph path (moss_tts_lite.fast); bitwise-identical
+                   decode to the eager reference (M1), ~36 steps/s on bf16 and
+                   ~82 on the shipped W4 GPTQ tiers.  There is NOTHING to pass:
+                   the fast path is what a bare command line runs.
+    --fast         no-op alias for the default (kept so existing scripts and
+                   docs keep working); prints a one-line note and changes
+                   nothing.
     --fast-native  whole-step CUDA graph tier (moss_tts_lite.fast_native,
                    arm n2); NOT bitwise -- swaps kernels for kernel-count
                    reduction, decodes a different-but-valid utterance at
-                   ~97 steps/s on W4 (text argmax 100%, audio top-25 97.5%)
+                   ~97 steps/s on W4 (text argmax 100%, audio top-25 97.5%).
+                   Faster than the default; read the --help entry before using
+                   it for a one-shot call (per-length graph capture is not
+                   amortized there).
+    --eager        reference slow path: plain MossTTSModel.step decoding with no
+                   CUDA graphs (~30 steps/s bf16).  Debugging / parity work
+                   only; it is NOT the default anymore.
 
 Pipeline: build_tts_prompt -> MossTTSModel -> generate -> 
 delayed_rows_to_segments -> MossCodecDecoder.decode -> soundfile.write
@@ -111,7 +121,7 @@ _BUILTIN_DEFAULTS = {
     "audio_top_p": 0.8,
     "audio_top_k": 25,
     "audio_repetition_penalty": 1.0,
-    "fast": False,
+    "fast": True,          # fast is the DEFAULT; --eager selects the slow path
     "fast_native": False,
     "watchdog": True,
     "watchdog_silence_frames": None,
@@ -281,7 +291,7 @@ def _resolve_gptq_state(spec: str, gptq_state: str | None,
 
 def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
               device, model_dir, codec_dir, chunk_duration, sampling, resident,
-              fast=False, quant=None, w4_group_size=None, watchdog=True,
+              fast=True, quant=None, w4_group_size=None, watchdog=True,
               watchdog_silence_frames=None, watchdog_max_segment_frames=None,
               max_requested_pause_s=None, gptq_state=None, fast_native=False,
               max_seq_len=None, max_graphs=None):
@@ -291,6 +301,8 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
     resident=False : TTS -> generate -> free -> codec -> decode.
     fast=True      : CUDA-graph decode path (moss_tts_lite.fast); numerics of the
                      exact path are preserved (M1: bitwise-identical decode).
+                     This is the DEFAULT for the CLI; fast=False is the eager
+                     reference (MossTTSModel.step, `--eager`).
     fast_native=True: whole-step CUDA graph tier (moss_tts_lite.fast_native,
                      arm n2).  NOT bitwise: it swaps kernels (`F.rms_norm`, fused
                      int4 GEMMs, fused heads) to cut the step's kernel count, so
@@ -329,10 +341,12 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
                     "[moss_tts_lite] --gptq-state cannot be combined with a "
                     "standalone model dir (the quantization is inside it)")
             if not fast:
-                print("[moss_tts_lite] --model-dir is a standalone quantized "
-                      "export; using the fast/quant decode path",
-                      file=sys.stderr)
-                fast = True
+                # Only reachable through the API (`fast=False`) or `--eager`: a
+                # standalone export has no bf16 weights to run eagerly.
+                raise SystemExit(
+                    "[moss_tts_lite] --model-dir is a standalone quantized "
+                    "export: it only runs the fast/quant decode path, so "
+                    "--eager (or fast=False) cannot be honoured here")
             model, fast_model = _load_tts_standalone(model_dir, dev, want_seq)
         else:
             model = _load_tts(model_dir, dev, want_seq)
@@ -418,7 +432,7 @@ def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False
                max_new_tokens=4096, device="cuda", model_dir=MODEL_DIR,
                codec_dir=CODEC_DIR, chunk_duration=8.0,
                sampling: dict | None = None, stats: dict | None = None,
-               fast=False, quant=None, w4_group_size=None, watchdog=True,
+               fast=True, quant=None, w4_group_size=None, watchdog=True,
                watchdog_silence_frames=None, watchdog_max_segment_frames=None,
                gptq_state=None, fast_native=False, max_seq_len=None,
                max_graphs=None):
@@ -426,6 +440,12 @@ def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False
 
     Tries the co-resident strategy (codec + TTS on one card) first and falls
     back to sequential (TTS freed before the codec loads) on CUDA OOM.
+
+    `fast=True` (the default, matching the CLI) selects the CUDA-graph path;
+    `fast=False` is the eager reference.  This mirrors the CLI's behaviour flip
+    (v1.1.0): a caller that wants the old eager default must now say so, and
+    `test_parity`/library callers that exercise `MossTTSModel.step` directly are
+    unaffected either way.
 
     `max_seq_len=None` (the CLI default) sizes the KV cache on demand; see
     `_resolve_max_seq_len`.  `max_graphs=None` keeps FastNativeTTS's own default.
@@ -488,13 +508,30 @@ def main(argv=None) -> int:
                         "call is unaffected (it captures every length once "
                         "anyway) while a long utterance in a long-lived process "
                         "degrades if N is too small")
-    p.add_argument("--device", default=None, help="'cuda' (default) or 'cpu'")
-    p.add_argument("--fast", action="store_true",
-                   help="CUDA-graph decode path (moss_tts_lite.fast); "
-                        "bitwise-identical output, faster steps")
+    p.add_argument("--device", default=None,
+                   help="'cuda' (default) or 'cpu'. The cpu path is the eager "
+                        "reference (no CUDA graphs) and does not support "
+                        "quantization")
+    p.add_argument("--fast", dest="fast", action="store_true",
+                   help="NO-OP (fast is already the default since v1.1.0): kept "
+                        "so existing scripts and docs keep working. Accepting "
+                        "it changes nothing and prints a one-line note. The "
+                        "default path is the CUDA-graph decoder "
+                        "(moss_tts_lite.fast), bitwise-identical to the eager "
+                        "reference; use --eager for that reference itself, or "
+                        "--fast-native for the faster non-bitwise tier")
+    p.add_argument("--eager", dest="eager", action="store_true",
+                   help="reference slow path, for debugging: plain eager "
+                        "MossTTSModel.step decoding (no CUDA graphs, ~30 "
+                        "steps/s on bf16). NOT bitwise-different from the "
+                        "default (the default is bitwise-identical to it), just "
+                        "slower -- use it to reproduce pre-v1.1.0 CLI "
+                        "behaviour or to bisect the fast path")
     p.add_argument("--fast-native", dest="fast_native", action="store_true",
                    help="whole-step CUDA graph tier (moss_tts_lite.fast_native, "
-                        "arm n2); NOT bitwise -- it swaps kernels (F.rms_norm, "
+                        "arm n2): FASTER than the default (~97 vs ~82 steps/s "
+                        "on W4) and NOT bitwise-identical -- it swaps kernels "
+                        "(F.rms_norm, "
                         "fused int4 GEMMs/heads) to cut the step's kernel "
                         "count and decodes a different-but-valid utterance: "
                         "text argmax 100%%, audio top-25 97.5%% (W4 baseline "
@@ -510,7 +547,8 @@ def main(argv=None) -> int:
     p.add_argument("--quant", default=None,
                    choices=["w4", "w4g32", "w8", "w4gptq", "w4gptq:w1p",
                             "w4gptq:w2", "w4gptq:auto"],
-                   help="weight quantization (implies --fast). GPTQ tiers "
+                   help="weight quantization (only exists on the fast path; "
+                        "implied since fast is the default). GPTQ tiers "
                         "(calibration-quantized, offline state): 'w4gptq' = "
                         "W1, the default tier (~8.3 GiB, ~81 steps/s, audio "
                         "top-25 89.30%% [CUDA topk] / 98.32%% [tie-robust], "
@@ -520,7 +558,7 @@ def main(argv=None) -> int:
                         "speed class as W1, quantized against the ten-language "
                         "calibration v3, see .tmp/reports/w1plus-1.md) - the "
                         "top-25 figure depends on the "
-                        "tie convention, see moss_tts_lite/README.md; "
+                        "tie convention, see README_ADVANCED.md; "
                         "'w4gptq:auto' = cached state if present, else fall "
                         "back to 'w4' with a notice. Non-GPTQ tiers: 'w4' = "
                         "RTN int4 group-128 (perf-m4 semantics; ~7.4 GiB, ~91 "
@@ -568,12 +606,42 @@ def main(argv=None) -> int:
         cfg["max_graphs"] = args.max_graphs
     if args.device is not None:
         cfg["device"] = args.device
+    if args.eager:
+        cfg["fast"] = False
+        cfg["fast_native"] = False
+        if args.fast:
+            # contradictory flags: last one wins would be silent, so say so
+            print("[moss_tts_lite] --eager wins over --fast (--fast is a no-op "
+                  "alias anyway); running the eager reference path",
+                  file=sys.stderr)
     if args.fast:
-        cfg["fast"] = True
+        # Kept for compatibility: the default is already the fast path, so the
+        # flag has nothing left to switch on.
+        if not args.eager:
+            print("[--fast is now the default; this flag is a no-op]",
+                  file=sys.stderr)
     if args.fast_native:
         # implies the fast path; the native tier needs the quantized container
         cfg["fast"] = True
         cfg["fast_native"] = True
+    if args.eager and args.fast_native:
+        raise SystemExit("[moss_tts_lite] --eager and --fast-native are mutually "
+                         "exclusive (--eager is the reference slow path, "
+                         "--fast-native the fastest CUDA-graph tier)")
+    if cfg["device"] == "cpu":
+        # The fast path is CUDA-graph based, so the default flip would break
+        # `--device cpu` outright.  Fall back to the reference path instead of
+        # crashing (this is the one case where eager is forced, and the note
+        # says why).
+        if cfg["fast_native"]:
+            raise SystemExit("[moss_tts_lite] --fast-native requires CUDA "
+                             "(whole-step CUDA graphs)")
+        if cfg["fast"]:
+            print("[moss_tts_lite] --device cpu: CUDA graphs need a GPU, so the "
+                  "eager reference path runs instead of the default fast path "
+                  "(quantization is likewise unavailable on cpu)",
+                  file=sys.stderr)
+            cfg["fast"] = False
     if args.fast_native and cfg["greedy"]:
         # generate_native() samples; greedy would need an argmax path that the
         # whole-step graph does not implement (the reference's greedy branch is
@@ -586,6 +654,11 @@ def main(argv=None) -> int:
     standalone_preset = None
     if args.model_dir and is_standalone_dir(args.model_dir):
         standalone_preset = standalone_presets(args.model_dir)[0]
+        if args.eager:
+            raise SystemExit(
+                f"[moss_tts_lite] {args.model_dir} is a standalone quantized "
+                f"export (preset {standalone_preset!r}); it has no bf16 weights, "
+                f"so --eager cannot run it -- drop --eager")
         cfg["fast"] = True
         if args.gptq_state:
             raise SystemExit(
@@ -600,14 +673,19 @@ def main(argv=None) -> int:
                     f"or point --model-dir at the {want!r} export")
         print(f"[moss_tts_lite] standalone quantized export detected: using its "
               f"built-in preset {standalone_preset!r}")
-    # --quant only exists on the fast path: enable it instead of silently
-    # running an invalid combination (quant would be ignored on eager).
+    # --quant only exists on the fast path.  Fast is the default, so --quant no
+    # longer switches anything on; the old "--quant implies --fast" notice is
+    # obsolete (there is nothing left for it to switch on), and --eager is the
+    # one combination that cannot work.
+    if args.quant is not None and args.eager:
+        raise SystemExit("[moss_tts_lite] --quant cannot be combined with --eager: "
+                         "weight quantization is only implemented on the fast "
+                         "path (drop --eager and let the default run)")
+    if args.quant is not None and cfg["device"] == "cpu":
+        raise SystemExit("[moss_tts_lite] --quant requires CUDA (the int4 "
+                         "kernels have no cpu fallback)")
     quant, w4_group, gptq_state = None, None, None
     if args.quant is not None and standalone_preset is None:
-        cfg["fast"] = True
-        if not args.fast:
-            print("[moss_tts_lite] --quant implies --fast; CUDA-graph fast path "
-                  "enabled")
         if args.quant == "w4":
             quant, w4_group = "w4", 128
         elif args.quant == "w4g32":
@@ -672,9 +750,17 @@ def main(argv=None) -> int:
     step_ms = stats.get("step_ms") or []
     avg = sum(step_ms) / len(step_ms) if step_ms else float("nan")
     graphs = stats.get("max_graphs")
+    # which decoder actually ran (v1.1.0 flipped the default to fast, so the
+    # summary names it explicitly instead of leaving it to be inferred)
+    if cfg.get("fast_native"):
+        path = "fast-native(n2,native-graphs)"
+    elif cfg["fast"]:
+        path = "fast(cuda-graphs,bitwise-vs-eager)"
+    else:
+        path = "eager(reference)"
     print(f"[moss_tts_lite] wrote {args.output}: {len(wav)} samples "
           f"({len(wav) / sr:.2f}s @ {sr} Hz), steps={res.n_steps}, "
-          f"finished={res.finished}, vram_strategy={strategy}, "
+          f"finished={res.finished}, path={path}, vram_strategy={strategy}, "
           f"prefill={stats.get('prefill_ms', float('nan')):.0f}ms, "
           f"decode avg={avg:.1f}ms/step ({1000 / avg:.1f} steps/s)")
     print(f"[moss_tts_lite] KV: L0={stats.get('l0')} + "

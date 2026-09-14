@@ -57,6 +57,13 @@ MAPPING = {
         "test_export.py": 6,              # phase_e1..phase_e6
         "test_vram_budget.py": 2,         # phase_0_sizing, phase_1_peaks
     },
+    # Added after the consolidation (v1.1.0 CLI default flip), not part of the
+    # original 20 files: help rendering / flag matrix / GPU path smoke.  Its
+    # count is not asserted against an original -- the file is a new gate.
+    "test_cli.py": {
+        "test_cli_defaults.py": 4,        # test_help_renders, test_flag_matrix,
+                                          #   test_gpu_paths, test_gpu_quant_default
+    },
 }
 
 #: files that must survive the consolidation untouched
@@ -76,11 +83,21 @@ def main() -> int:
 
     total_want = 0
     total_got = 0
+    merged_want = sum(sum(s.values()) for f, s in MAPPING.items()
+                      if f != "test_cli.py")
+    merged_got = sum(len(counted(os.path.join(here, f)))
+                     for f in MAPPING if f != "test_cli.py")
     for out_name, sources in sorted(MAPPING.items()):
         n_want = sum(sources.values())
         names = counted(os.path.join(here, out_name))
         total_want += n_want
         total_got += len(names)
+        if out_name == "test_cli.py":
+            # scope note: this file is a *new* gate, not a merge target, so it
+            # only has to exist and be non-trivial
+            if not names:
+                problems.append("test_cli.py: no test_* functions")
+            continue
         if len(names) != n_want:
             problems.append(f"{out_name}: {len(names)} test/phase funcs, want {n_want}")
         # no original may still be present.  test_fast.py is the one name that
@@ -97,12 +114,13 @@ def main() -> int:
     left = sorted(p for p in os.listdir(here) if p.startswith("test_"))
     if len(left) != len(MAPPING):
         problems.append(f"test_*.py count {len(left)}, want {len(MAPPING)}: {left}")
-
-    ok = not problems and total_got == total_want == 55
+    ok = not problems and merged_got == merged_want == 55
     print(f"_merge_check: {'PASS' if ok else 'FAIL'} "
-          f"({total_got}/{total_want} test_*/phase* functions across "
-          f"{len(MAPPING)} files"
-          + ("" if ok else "; " + "; ".join(problems)) + ")")
+          f"({merged_got}/{merged_want} test_*/phase* functions across "
+          f"{len(MAPPING) - 1} merged files; "
+          f"{len(counted(os.path.join(here, 'test_cli.py')))} in the new "
+          f"test_cli.py)"
+          + ("" if ok else "; " + "; ".join(problems)))
     return 0 if ok else 1
 
 

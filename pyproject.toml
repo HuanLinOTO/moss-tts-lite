@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "moss-tts-lite"
-version = "1.0.0"
-description = "Minimal MOSS-TTS-v1.5 inference stack: 4 dependencies, bitwise-exact + fast decode paths, W4 GPTQ tiers, 8GB-card support"
+version = "1.1.0"
+description = "Minimal MOSS-TTS-v1.5 inference stack: 4 dependencies, fast CUDA-graph decode by default (bitwise-exact) + native tier + W4 GPTQ tiers, 8GB-card support"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"

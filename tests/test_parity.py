@@ -432,10 +432,15 @@ def main_e2e() -> int:
     # ---------- 1) zh: golden text -> wav, compare with codec_golden.wav ----------
     print("=== E2E zh (golden text, seed=1234) ===", flush=True)
     stats: dict = {}
+    # v1.1.0 flipped the CLI/`synthesize` default to the fast (CUDA-graph) path;
+    # this phase is the EAGER reference artifact, so it asks for it explicitly.
+    # Fast is bitwise-identical to eager (phase A/B above), so the golden
+    # comparison below is unaffected by the flip -- only the speed baseline is
+    # (fast: 137 steps at ~28 ms/step instead of eager's ~34).
     wav, sr, res, strategy = synthesize(
         zh["text"], os.path.join(OUT_DIR, "e2e_zh.wav"),
         seed=zh["seed"], max_new_tokens=4096,
-        sampling=dict(zh["sampling"]), stats=stats)
+        sampling=dict(zh["sampling"]), stats=stats, fast=False)
     assert sr == SR, sr
     assert torch.equal(res.audio_frames, zh["generation_ids"][:, 1:]), \
         "audio codes no longer EXACT vs gen_golden"
@@ -457,7 +462,7 @@ def main_e2e() -> int:
     # ---------- 2) speed baseline (from the zh run above) ----------
     prefill_ms = stats.get("prefill_ms")
     step_ms = stats.get("step_ms") or []
-    print("=== speed baseline (bf16, A10G, zh 137 steps) ===")
+    print("=== speed baseline (bf16 eager reference, A10G, zh 137 steps) ===")
     print(f"prefill: {prefill_ms:.1f} ms (L={zh['prompt_L']})")
     print(f"decode:  avg {sum(step_ms) / len(step_ms):.2f} ms/step over "
           f"{len(step_ms)} steps -> {1000 / (sum(step_ms) / len(step_ms)):.1f} steps/s "
@@ -471,7 +476,8 @@ def main_e2e() -> int:
     wav_en, _, res_en, strat_en = synthesize(
         en["text"], os.path.join(OUT_DIR, "e2e_en.wav"),
         language=en["kwargs"].get("language"), seed=en["seed"],
-        max_new_tokens=4096, sampling=dict(en["sampling"]), stats=stats_en)
+        max_new_tokens=4096, sampling=dict(en["sampling"]), stats=stats_en,
+        fast=False)   # eager reference artifact (see the zh note above)
     assert torch.equal(res_en.audio_frames, en["generation_ids"][:, 1:]), \
         "en audio codes no longer EXACT vs gen_golden"
     dur_en = len(wav_en) / SR

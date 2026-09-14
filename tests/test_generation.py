@@ -306,10 +306,16 @@ def phase_a(model):
               f"stats={st}")
         ok &= res.watchdog_triggered and res.finished
         ok &= res.n_steps < expect_steps
-        verdict_codes = torch.load(
-            os.path.join(ROOT, ".tmp", "verdict_agent", "codes",
-                         f"extra_en4_w4_s{seed}.pt"),
-            map_location="cpu", weights_only=True).long()
+        # cross-run reference rows come from the (unshipped) verdict battery; a
+        # checkout without those artifacts still gates the watchdog itself
+        ref_path = os.path.join(ROOT, ".tmp", "verdict_agent", "codes",
+                                f"extra_en4_w4_s{seed}.pt")
+        if not os.path.exists(ref_path):
+            print(f"  [s{seed}] pre-trigger vs verdict rows: SKIP "
+                  f"({os.path.relpath(ref_path, ROOT)} not present)")
+            continue
+        verdict_codes = torch.load(ref_path, map_location="cpu",
+                                   weights_only=True).long()
         S = int(st["step"])
         pre_mine = res.audio_frames[:S].long()
         pre_ref = verdict_codes[:S]
