@@ -8,12 +8,14 @@ moss_tts_lite.prompt (tok) + golden assets replace this.
 """
 
 import json
+import os
 import re
 from pathlib import Path
 
 import torch
 
-MODEL_DIR = "/root/MOSS-TTS/models/MOSS-TTS-v1.5"
+MODEL_DIR = os.environ.get(
+    "MOSS_TTS_ROOT", "/root/MOSS-TTS") + "/models/MOSS-TTS-v1.5"
 
 IM_START = 151644
 IM_END = 151645
