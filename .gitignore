@@ -6,3 +6,4 @@ models/
 *.wav
 .tmp/
 libmoss_native.so
+_native/
