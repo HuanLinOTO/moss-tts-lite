@@ -1,25 +1,10 @@
-"""Generation tests: greedy/sampled trajectories and the silence watchdog.
-
-``generate()`` end-to-end trajectory and state-walk checks on real
-weights, plus the watchdog gates (golden EXACT regression, long-form
-false-positive guard, ``[pause Xs]`` preservation, en4 W4 runaway
-reproduction).  GPU, run under the GPU lock.
-
-Consolidated from:
-  test_generate.py
-  test_fast_watchdog.py
-
-Run:
-  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_generation.py
-"""
+"""Generation tests:"""
 
 from __future__ import annotations
 
 import os
 import sys
 
-# `python3 tests/<this file>.py` straight from the repo root must import
-# moss_tts_lite without an explicit PYTHONPATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -38,15 +23,10 @@ from moss_tts_lite.prompt import build_continuation_prompt, build_tts_prompt
 
 try:
     from moss_tts_lite.st_loader import read_safetensors
-except ImportError:  # pragma: no cover
+except ImportError:
     from tests._mini_loader import read_safetensors_min as read_safetensors
 from tests._mini_bpe import build_tts_prompt_dev
 
-# --------------------------------------------------------------------------- #
-# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
-# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
-# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
-# --------------------------------------------------------------------------- #
 ROOT = os.environ.get("MOSS_TTS_ROOT",
                       os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
@@ -54,13 +34,6 @@ CODEC_DIR = os.path.join(ROOT, "models", "MOSS-Audio-Tokenizer")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 OUT = os.path.join(ROOT, ".tmp", "perf_agent")
 LISTEN_AGENT = os.path.join(ROOT, ".tmp", "listen_agent")
-
-
-# ------------------------------------------------------------------------- #
-# ---- from test_generate.py ----
-# ------------------------------------------------------------------------- #
-
-
 
 def main_generate():
     dev = torch.device("cuda")
@@ -84,27 +57,24 @@ def main_generate():
     t = res.text_ids.tolist()
     fr = res.audio_frames
 
-    # ---- trajectory shape checks ----
     if AUDIO_START_TOKEN_ID in t:
         i_start = t.index(AUDIO_START_TOKEN_ID)
-        # before audio starts: only pad allowed
+
         pre = [x for x in t[:i_start] if x != 151643]
         assert not pre, f"unexpected pre-audio text tokens: {pre[:8]}"
         i_first_gen = i_start + 1
         assert t[i_start + 1] == AUDIO_GEN_SLOT_TOKEN_ID, \
             f"first post-start row must be gen_slot, got {t[i_start + 1]}"
-        # ramp: gen rows between audio_start and the first delay slot (K rows;
-        # K = audio frame count, delay tail fills the remaining channels)
+
         i_delay = t.index(AUDIO_DELAY_SLOT_TOKEN_ID)
         assert i_delay >= i_first_gen, (i_delay, i_first_gen)
-        # delay tail: exactly 32 delay rows (1 sampled + 31 forced), then audio_end
-        # (reference state machine: delayed_lengths runs 0->32; audio_end at ==n_vq)
+
         delay_rows = [x for x in t[i_delay:] if x in (AUDIO_DELAY_SLOT_TOKEN_ID, AUDIO_END_TOKEN_ID)]
         assert delay_rows[0] == AUDIO_DELAY_SLOT_TOKEN_ID
         k = delay_rows.index(AUDIO_END_TOKEN_ID)
         assert k == 32, f"expected 32 delay rows before audio_end, got {k}"
         assert t[i_delay + 32] == AUDIO_END_TOKEN_ID
-        # audio_end row: all channels forced pad
+
         assert (fr[i_delay + 32] == AUDIO_PAD_CODE).all(), \
             "audio_end row must be all-pad"
         print("delay-pattern trajectory: audio_start@%d, %d gen rows (~%d frames), "
@@ -115,11 +85,9 @@ def main_generate():
         assert IM_END_TOKEN_ID not in t[:-1], "im_end mid-stream"
     print("text stream:", [hex(x) for x in t[:8]], "...", [hex(x) for x in t[-6:]])
 
-    # ---- pad-code hygiene + independent state-walk over audio masks ----
     assert fr.min() >= 0 and fr.max() <= 1024
     real = fr[fr != AUDIO_PAD_CODE]
-    # re-derive expected sampled-channel sets from the text stream using the
-    # reference counter semantics (audio_lengths / delayed_lengths)
+
     MAXD = 2**63 - 1
     al, delayed = 0, MAXD
     for r, tt in enumerate(t):
@@ -144,7 +112,6 @@ def main_generate():
     print(f"audio frames: {tuple(fr.shape)}, pad-ratio={float((fr == AUDIO_PAD_CODE).float().mean()):.3f}, "
           + (f"non-pad codes in [{int(real.min())}, {int(real.max())}]" if real.numel() else "all pad"))
 
-    # ---- seeded sampling determinism ----
     res2 = generate(model, prompt, max_new_tokens=120, greedy=False, seed=1234)
     res3 = generate(model, prompt, max_new_tokens=120, greedy=False, seed=1234)
     assert res2.n_steps == res3.n_steps
@@ -155,15 +122,10 @@ def main_generate():
 
     print("test_generate PASS")
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_fast_watchdog.py ----
-# ------------------------------------------------------------------------- #
 try:
     from moss_tts_lite.st_loader import read_safetensors
-except ImportError:  # pragma: no cover
+except ImportError:
     from tests._mini_loader import read_safetensors_min as read_safetensors
-
 
 SR = 24000
 FPS = 12.5
@@ -179,7 +141,6 @@ LONG_TEXT = (
     "些古老的句子，继续陪伴我们走过每一个春夏秋冬。")
 PAUSE_TEXT = "我今天学习了一首中国的古诗，它的名字是[pause 8s]静夜思！"
 
-
 def _frame_db(wav: np.ndarray, n_frames: int) -> np.ndarray:
     out = np.full(n_frames, np.nan)
     for k in range(n_frames):
@@ -187,7 +148,6 @@ def _frame_db(wav: np.ndarray, n_frames: int) -> np.ndarray:
         if len(a):
             out[k] = 20 * np.log10(max(float(np.abs(a).max()), 1e-10))
     return out
-
 
 def _max_silent_run(wav: np.ndarray, tau_db: float = -45.0) -> int:
     n = int(len(wav) // HOP)
@@ -197,7 +157,6 @@ def _max_silent_run(wav: np.ndarray, tau_db: float = -45.0) -> int:
         cur = cur + 1 if v <= tau_db else 0
         best = max(best, cur)
     return best
-
 
 def _decode_to_wav(res, out_path):
     codec = MossCodecDecoder(CODEC_DIR, device=torch.device("cuda"))
@@ -210,9 +169,8 @@ def _decode_to_wav(res, out_path):
     torch.cuda.empty_cache()
     return wav, len(segments)
 
-
 def phase_b(fast):
-    """Golden zh/en trajectories: watchdog on, EXACT preserved, no trigger."""
+    """Golden zh/en trajectories:"""
     print("=== Phase B: golden EXACT regression (watchdog on) ===")
     pg = torch.load(os.path.join(GOLDEN, "prompt_golden.pt"),
                     map_location="cpu", weights_only=False)
@@ -240,9 +198,8 @@ def phase_b(fast):
     print(f"  phaseB gate: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
 def phase_long(fast):
-    """275-char zh long-form: crosses the 640-frame floor, must NOT trigger."""
+    """275-char zh long-form:"""
     print("=== Phase L: long-form zh (275 chars) must not trigger ===")
     assert _max_pause_s(LONG_TEXT) is None
     res = generate_fast(fast, build_tts_prompt(LONG_TEXT),
@@ -250,14 +207,13 @@ def phase_long(fast):
     dur = res.n_steps / FPS
     print(f"  [long] steps={res.n_steps} (~{dur:.1f}s) finished={res.finished} "
           f"triggered={res.watchdog_triggered} reason={res.watchdog_reason}")
-    crossed = res.n_steps > 640          # exercised the v1 false-positive zone
+    crossed = res.n_steps > 640
     ok = (not res.watchdog_triggered) and res.finished and crossed
     print(f"  crossed 640-frame floor: {crossed}; gate: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
 def phase_pause(fast):
-    """[pause 8s]: pause-aware threshold; the requested pause survives."""
+    """[pause 8s]:"""
     print("=== Phase P: explicit [pause 8s] preserved ===")
     assert _max_pause_s(PAUSE_TEXT) == 8.0
     assert _max_pause_s("no markers here") is None
@@ -277,16 +233,10 @@ def phase_pause(fast):
     print(f"  phaseP gate: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# Continuation corpus for this gate (texts inlined: moss_tts_lite/ must not import
-# from .tmp/, per the dependency-purity gate).  Source of the strings:
-# .tmp/listen_agent/listen2_texts.py (pair 4, English) — the exact text used by
-# the verdict-1 runaway reproduction, so the W4 trajectories stay comparable.
 EN_REF_TRANSCRIPT = ("But I really can't complain about not having a normal "
                      "college experience to you.")
 EN4_TEXT = ("Hello! This is a short continuation test. Please listen for a "
             "stable and natural voice.")
-
 
 def phase_a(model):
     """Reproduce the en4 W4 runaway with the watchdog on (rule a)."""
@@ -306,8 +256,7 @@ def phase_a(model):
               f"stats={st}")
         ok &= res.watchdog_triggered and res.finished
         ok &= res.n_steps < expect_steps
-        # cross-run reference rows come from the (unshipped) verdict battery; a
-        # checkout without those artifacts still gates the watchdog itself
+
         ref_path = os.path.join(ROOT, ".tmp", "verdict_agent", "codes",
                                 f"extra_en4_w4_s{seed}.pt")
         if not os.path.exists(ref_path):
@@ -338,7 +287,6 @@ def phase_a(model):
     print(f"  phaseA gate: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
 def main_fast_watchdog() -> int:
     assert torch.cuda.is_available()
     print("loading weights ...", flush=True)
@@ -348,7 +296,6 @@ def main_fast_watchdog() -> int:
     del weights
     torch.cuda.empty_cache()
 
-    # bf16 phases first (pristine model); phase_a quantizes IN PLACE last.
     fast = FastMossTTS(model)
     ok_b = phase_b(fast)
     ok_long = phase_long(fast)
@@ -364,18 +311,12 @@ def main_fast_watchdog() -> int:
           f"-> {'PASS' if (ok_a and ok_b and ok_long and ok_pause) else 'FAIL'}")
     return 0 if (ok_a and ok_b and ok_long and ok_pause) else 1
 
-
-# --------------------------------------------------------------------------- #
-# Unified entry point: each source file's own entry function, in order.
-# --------------------------------------------------------------------------- #
-
 def main() -> int:
     rc = 0
     rc |= main_generate() or 0
     rc |= main_fast_watchdog() or 0
 
     return rc
-
 
 if __name__ == "__main__":
     sys.exit(main())

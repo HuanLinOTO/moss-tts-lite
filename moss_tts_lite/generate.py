@@ -1,15 +1,4 @@
-"""Delay-pattern generation loop, ported line-by-line from
-models/MOSS-TTS-v1.5/modeling_moss_tts.py MossTTSDelayModel.generate.
-
-batch=1, KV cache reuse, greedy (all temperatures=0 -> argmax) and seeded
-sampling.  Deviations from the reference are limited to (a) python scalars
-for the batch=1 state bookkeeping, (b) the audio-phase text head: when
-sampling, the FULL 155648 vocab head is used exactly like the reference (so
-the multinomial RNG stream matches); when greedy, the fused 2-way head
-(gen_slot/delay_slot rows only) replaces the full head -- mathematically
-identical because the reference masks the full vector to exactly those two
-finite entries before argmax.
-"""
+"""Delay-pattern generation loop, ported line-by-line from models/MOSS-TTS-v1."""
 
 from dataclasses import dataclass
 
@@ -29,14 +18,12 @@ from .sampling import find_last_equal_C, sample_token
 
 _INT64_MAX = 9223372036854775807
 
-
 @dataclass
 class GenResult:
-    text_ids: torch.Tensor      # [T] per-step next_text_token (incl. pad/forced rows)
-    audio_frames: torch.Tensor  # [T, 32] per-step next_audio_tokens (pad=1024 kept)
-    finished: bool              # True iff is_stopping became True (im_end emitted)
-    n_steps: int                # executed loop iterations
-
+    text_ids: torch.Tensor
+    audio_frames: torch.Tensor
+    finished: bool
+    n_steps: int
 
 @torch.inference_mode()
 def generate(
@@ -75,7 +62,6 @@ def generate(
 
     seq_len = int(input_ids.shape[1])
 
-    # optional CUDA-event timing (performance baseline; correctness unaffected)
     _stats = stats if (stats is not None and device.type == "cuda") else None
 
     def _t0():
@@ -98,7 +84,6 @@ def generate(
         raise ValueError(f"prompt {seq_len} + max_new_tokens {max_new_tokens} "
                          f"exceeds KV cache {model.max_seq_len}")
 
-    # reference preamble: temperature>0 -> sample; else temperature:=1, greedy
     if greedy:
         text_temperature = 0
         audio_temperature = 0
@@ -145,11 +130,11 @@ def generate(
     current_input_ids = None
 
     for time_step in range(max_new_tokens):
-        # ---- backbone forward (prefill once, then single-token steps) ----
+
         e0 = _t0()
         hs = model.prefill(input_ids) if time_step == 0 else model.step(current_input_ids)
         _t1(e0, "prefill" if time_step == 0 else "step")
-        h = hs.last_hidden[:, -1]  # [1, hidden] (last prompt pos on step 0)
+        h = hs.last_hidden[:, -1]
 
         next_text_token = torch.full((batch_size,), PAD_TOKEN_ID, device=device)
         next_text_token[~is_stopping & (delayed_lengths < n_vq)] = AUDIO_DELAY_SLOT_TOKEN_ID
@@ -166,19 +151,17 @@ def generate(
         sampling_audio_mask = pre_audio_mask & post_audio_mask
         next_audio_tokens[~sampling_audio_mask] = AUDIO_PAD_CODE
 
-        # ---- text head (reference: logits/temp, then state-dependent masking) ----
         if bool(sampling_text_mask[0]):
             if bool(is_audio[0]) and not text_do_sample:
-                # audio phase + greedy: 2-way head; identical to argmax over the
-                # full vocab vector whose only finite entries are gen/delay
-                two = model.text_logits_2way(h) / text_temperature  # [2] gen, delay
+
+                two = model.text_logits_2way(h) / text_temperature
                 if time_step == 0:
                     two[1] = float("-inf")
                 pick = int(torch.argmax(two))
                 next_text_token[sampling_text_mask] = (
                     AUDIO_GEN_SLOT_TOKEN_ID if pick == 0 else AUDIO_DELAY_SLOT_TOKEN_ID)
             else:
-                lt = model.text_logits(h) / text_temperature  # [V], fresh
+                lt = model.text_logits(h) / text_temperature
                 if bool(is_audio[0]):
                     lt = lt.masked_fill(pre_exclude_mask1, float("-inf"))
                 else:
@@ -193,9 +176,8 @@ def generate(
         is_audio[next_text_token == AUDIO_START_TOKEN_ID] = True
         is_stopping[next_text_token == IM_END_TOKEN_ID] = True
 
-        # ---- audio heads ----
         if bool(sampling_audio_mask[0].any()):
-            audio_logit = model.audio_logits(h) / audio_temperature  # [32, 1025]
+            audio_logit = model.audio_logits(h) / audio_temperature
             if bool(sampling_audio_mask[0, 0]):
                 audio_ch0_logits = audio_logit[0].view(1, -1)
                 audio_ch0_logits[..., AUDIO_PAD_CODE] = float("-inf")
@@ -207,7 +189,7 @@ def generate(
                 next_audio_tokens[:, 0][sampling_audio_mask[:, 0]] = int(tok0[0])
             rest_idx = [j for j in range(1, n_vq) if bool(sampling_audio_mask[0, j])]
             if rest_idx:
-                audio_logits_rest = audio_logit[rest_idx]  # [n2, 1025], ascending j
+                audio_logits_rest = audio_logit[rest_idx]
                 audio_logits_rest[..., AUDIO_PAD_CODE] = float("-inf")
                 tok = sample_token(
                     logits=audio_logits_rest,
@@ -217,7 +199,6 @@ def generate(
                 for k, j in enumerate(rest_idx):
                     next_audio_tokens[0, j] = int(tok[k])
 
-        # ---- counters (exact reference order) ----
         audio_lengths[(next_text_token == AUDIO_START_TOKEN_ID)
                       | (next_text_token == AUDIO_GEN_SLOT_TOKEN_ID)
                       | (next_text_token == AUDIO_DELAY_SLOT_TOKEN_ID)] += 1
@@ -233,7 +214,7 @@ def generate(
         generation_ids = torch.cat([generation_ids, current_input_ids], dim=1)
 
         text_steps.append(int(next_text_token[0]))
-        audio_steps.append(next_audio_tokens[0].clone())  # [32]
+        audio_steps.append(next_audio_tokens[0].clone())
         n_steps += 1
 
         if bool(is_stopping.all()):

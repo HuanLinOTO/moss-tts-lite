@@ -1,32 +1,4 @@
-"""CUDA-graph accelerated decode for MOSS-TTS.
-
-FastMossTTS wraps an already-built MossTTSModel and replays its exact decode
-op sequence from static CUDA graphs.  Numerics policy: every tensor op inside
-the graphs is the SAME op with the SAME shapes/order as MossTTSModel.step +
-heads, so decode hidden states / logits are bitwise identical to the exact
-path.  Only three structural rewrites were needed to make the step
-graph-capturable, all value-preserving:
-
-  * the KV-cache slot write uses index_copy_ with a device position scalar
-    (graph-capturable) instead of python-int slice assignment (same values
-    written to the same slot);
-  * rope tables are fetched with index_select(0, pos) instead of a slice
-    (same row values);
-  * attention itself stays OUTSIDE the graphs (eager, at the exact current
-    cache length, the identical call used by model._layer).  A padded
-    masked-bucket attention would dispatch to a different SDPA kernel and
-    change bf16 rounding (probed: flash no-mask != mem-efficient masked,
-    measured; see git history), so whole-step capture is
-    numerically out under the EXACT gate; 38 sub-graphs (1 + n_layers + 1
-    audio-phase head variant) bracket the 36 eager attentions instead
-    (1 launch each instead of ~25 kernels).
-
-Sampling and the delay-pattern state machine are re-implemented in
-generate_fast mirroring moss_tts_lite.generate exactly; with batch=1 the
-mask/counter bookkeeping is a pure function of the host-scalar state, so it
-is computed with python ints (identical values, fewer device round-trips).
-Sampling ops are the same calls in the same order => identical RNG stream.
-"""
+"""CUDA-graph accelerated decode for MOSS-TTS."""
 
 from __future__ import annotations
 
@@ -54,24 +26,10 @@ from .generate import GenResult
 
 _INT64_MAX = 9223372036854775807
 
-# backbone linear names (the only tensors quantized in w8/w4 modes)
 _LIN_NAMES = ("q", "k", "v", "o", "gate", "up", "down")
 
-
 class FastMossTTS:
-    """CUDA-graph decoder around a MossTTSModel (weights/cache are shared).
-
-    Usage:
-        fast = FastMossTTS(model)          # after MossTTSModel(weights)
-        ... hs = model.prefill(input_ids)  # exact eager prefill fills the KV cache
-        fast.capture()                     # once; ~4 step-times, uses a scratch slot
-        lt, la, h, two = fast.step(row, pos, audio2=is_audio)
-
-    Returned tensors are static graph-output buffers, valid until the next
-    step() call.  lt [text_vocab] (text-phase graph), la [32, 1025] (pad
-    column -inf), h [1, hidden] post-final-norm, two [2] gen/delay logits
-    (audio-phase graph).
-    """
+    """CUDA-graph decoder around a MossTTSModel (weights/cache are shared)."""
 
     def __init__(self, model, enable_gqa: bool = True, gqa_max_len: int = 640,
                  quant: str | None = None, inner_k_tiles: int = 8,
@@ -80,20 +38,16 @@ class FastMossTTS:
         dev = model.device
         self.enable_gqa = enable_gqa
         self.quant = quant
-        # probe: enable_gqa == repeat_interleave bitwise for kv len <= 640,
-        # mismatch starts at 641 (flash tiling changes) -> fall back above.
+
         self.gqa_max_len = gqa_max_len
         if quant not in (None, "w8", "w4"):
             raise ValueError(f"unsupported quant mode {quant!r} (None, 'w8' or 'w4')")
         self.inner_k_tiles = inner_k_tiles
-        # w4 group size: 128 default (speed-first: 91.5 vs 84.0 steps/s and
-        # -0.6 GiB vs g32; g32 trades ~7.6% speed for +6pts audio top-25
-        # membership — available via FastMossTTS(quant="w4", w4_group_size=32)
-        # or CLI --quant w4g32).  Kernel supports 32/64/128/256.
+
         if w4_group_size not in (32, 64, 128, 256):
             raise ValueError("w4_group_size must be 32/64/128/256")
         self.w4_group_size = w4_group_size
-        # ---- static I/O buffers (allocated outside any graph pool) ----
+
         self.ids_row = torch.zeros(1, 1, N_VQ + 1, dtype=torch.long, device=dev)
         self.pos_dev = torch.zeros(1, dtype=torch.long, device=dev)
         self.q_static = torch.zeros(1, model.n_heads, 1, model.head_dim,
@@ -103,10 +57,7 @@ class FastMossTTS:
         self.h_final = torch.zeros(1, model.hidden_size, dtype=model.dtype, device=dev)
         self.lt_static = torch.zeros(model.text_vocab, dtype=model.dtype, device=dev)
         self.la_static = torch.zeros(N_VQ, AUDIO_PAD_CODE + 1, dtype=model.dtype, device=dev)
-        # 2-way head output (gen/delay rows) + scatter buffer for the audio
-        # phase: probe-verified bitwise == the full-head rows, so scattering
-        # them into a -inf [V] buffer reproduces the exact masked vector and
-        # the exact multinomial call shape (same RNG stream).
+
         self.two_static = torch.zeros(2, dtype=model.dtype, device=dev)
         self.lt_buf = torch.full((model.text_vocab,), float("-inf"),
                                  dtype=model.dtype, device=dev)
@@ -116,32 +67,22 @@ class FastMossTTS:
         self.graphs: list | None = None
         self.capture_stream = torch.cuda.Stream() if dev.type == "cuda" else None
 
-    # ------------------------------------------------- quant (M3/M4) ------
     def _quantize(self) -> None:
-        """Quantize the 7 backbone linears/layer; drop the bf16 originals.
-
-        w8: per-channel symmetric RTN int8 + fp32 scales [N]
-            (torch._weight_int8pack_mm; EXPERIMENTAL memory-saving mode only:
-            no fast decode kernel on this stack, see perf-m3-w8.md).
-        w4: group-128 asymmetric int4 packed via _convert_weight_to_int4pack
-            (torch._weight_int4pack_mm; fused decode kernel, the fast path).
-        Norms / embeddings / all heads stay bf16.  Quality gates (M4) apply
-        instead of bitwise.
-        """
+        """Quantize the 7 backbone linears/layer;"""
         m = self.m
         self.qlayers = []
         for li in range(m.n_layers):
             lyr = m.layers[li]
             qd = {}
             for name in _LIN_NAMES:
-                w = lyr[name]                       # [N, K] bf16
+                w = lyr[name]
                 if self.quant == "w8":
                     wf = w.float()
                     sc = (wf.abs().amax(dim=1) / 127.0).clamp(min=1e-8)
                     w8 = torch.round(wf / sc[:, None]).clamp(-127, 127).to(torch.int8)
                     qd[name] = (w8.contiguous(), sc.contiguous())
                     del wf, w8
-                else:                               # w4, asymmetric affine
+                else:
                     N, K = w.shape
                     g = self.w4_group_size
                     wg = w.float().reshape(N, K // g, g)
@@ -149,35 +90,22 @@ class FastMossTTS:
                     s = ((mx - mn) / 15.0).clamp(min=1e-6)
                     q = ((wg - mn) / s).round().clamp(0, 15) \
                         .to(torch.uint8).reshape(N, K)
-                    # kernel semantics (empirically verified, probe_w4bb):
-                    #   value = nibble - 8 (offset binary), adjacent k pairs
-                    #   swapped vs even|odd<<4 -> pack odd|even<<4;
-                    #   dequant = value*s + zero -> zero = mn + 8s so that
-                    #   dequant ~= q*s + mn
+
                     qsz = torch.stack(
                         [s.squeeze(-1), (mn + 8.0 * s).squeeze(-1)], -1) \
-                        .bfloat16().transpose(0, 1).contiguous()  # [K/g, N, 2]
+                        .bfloat16().transpose(0, 1).contiguous()
                     packed = torch.ops.aten._convert_weight_to_int4pack(
                         (q[:, 1::2] | (q[:, 0::2] << 4)).contiguous(),
                         self.inner_k_tiles)
                     qd[name] = (packed, qsz)
                     del wg, q
-                # group comment: g must stay even so adjacent-pair nibble
-                # swaps never cross a group boundary (32/64/128/256 all ok)
-                lyr.pop(name)                       # free the bf16 original
+
+                lyr.pop(name)
             self.qlayers.append(qd)
         torch.cuda.empty_cache()
 
     def _linear(self, x: torch.Tensor, li: int, name: str) -> torch.Tensor:
-        """Backbone linear in the active weight mode (bf16 / int8pack / int4pack).
-
-        w8: _weight_int8pack_mm returns scales.dtype (fp32) -> cast back to
-        the model dtype once (fp32 accumulate x fp32 scale, single rounding).
-        w4: _weight_int4pack_mm dequant convention w ~= q*s + mn (q in
-        [0,15], group = self.w4_group_size, value=nibble-8,
-        zeros = mn + 8s), scales_and_zeros bf16 [K/g, N, 2]; returns
-        activation dtype (bf16), guarded cast kept for safety.
-        """
+        """Backbone linear in the active weight mode (bf16 / int8pack / int4pack)."""
         if self.quant is None:
             return F.linear(x, self.m.layers[li][name])
         wq = self.qlayers[li][name]
@@ -192,7 +120,6 @@ class FastMossTTS:
             out = out.to(self.m.dtype)
         return out.reshape(*x.shape[:-1], qsz.shape[1])
 
-    # ---------------------------------------------------- graph pieces ----
     def _p_embed(self) -> None:
         m = self.m
         h = F.embedding(self.ids_row[..., 0], m.embed_tokens)
@@ -220,12 +147,7 @@ class FastMossTTS:
         self.q_static.copy_(q)
 
     def _p_attn(self, li: int, s1: int) -> None:
-        """Eager attention at the EXACT current cache length (not captured).
-
-        Same expression as model._layer: exact-L slice, GQA via
-        enable_gqa (probe-verified bitwise == repeat_interleave) or the
-        verbatim repeat_interleave call.
-        """
+        """Eager attention at the EXACT current cache length (not captured)."""
         m = self.m
         if self.enable_gqa and s1 <= self.gqa_max_len:
             keys = m.k_cache[li, :, :s1].unsqueeze(0)
@@ -261,9 +183,7 @@ class FastMossTTS:
         self.la_static.copy_(la)
 
     def _p_final_audio2(self) -> None:
-        """Audio-phase variant: 2-way text head instead of the full 155648
-        head (rows probe-verified bitwise-identical -> exact-sampling safe),
-        + the 32 audio heads.  Saves the 1.28 GB/step text-head read."""
+        """Audio-phase variant:"""
         m = self.m
         hf = _rms_norm(self.h_static, m.final_norm)
         self.h_final.copy_(hf.view(1, m.hidden_size))
@@ -273,7 +193,6 @@ class FastMossTTS:
         la[..., AUDIO_PAD_CODE] = float("-inf")
         self.la_static.copy_(la)
 
-    # -------------------------------------------------- whole-step eager --
     def _run_eager(self, s1: int) -> None:
         """One full decode step without graphs (capture warmup / debugging)."""
         n = self.m.n_layers
@@ -288,9 +207,8 @@ class FastMossTTS:
                 self._p_post(li)
                 self._p_final()
 
-    # -------------------------------------------------- quant prefill ----
     def _embed_q(self, ids: torch.Tensor) -> torch.Tensor:
-        """model._embed replica (embeddings stay bf16)."""
+        """model."""
         m = self.m
         h = F.embedding(ids[..., 0], m.embed_tokens)
         for i in range(N_VQ):
@@ -298,7 +216,7 @@ class FastMossTTS:
         return h
 
     def _layer_q(self, li: int, h: torch.Tensor, s0: int) -> torch.Tensor:
-        """model._layer replica with quantized linears (verbatim attention)."""
+        """model."""
         m = self.m
         lyr = m.layers[li]
         t = h.shape[1]
@@ -331,7 +249,7 @@ class FastMossTTS:
         return h
 
     def prefill(self, input_ids: torch.Tensor) -> HiddenState:
-        """Dispatch: exact bf16 prefill, or the quantized replica."""
+        """Dispatch:"""
         if self.quant is None:
             return self.m.prefill(input_ids)
         m = self.m
@@ -351,14 +269,8 @@ class FastMossTTS:
         m._seq = t
         return HiddenState(h)
 
-    # ---------------------------------------------------------- capture ---
     def capture(self) -> None:
-        """Capture the 37 step sub-graphs (1 + n_layers).
-
-        Warmup + capture run with pos at a scratch slot (max_seq_len-1), so
-        the real cache region is never touched; graph outputs are garbage
-        until the first real step.
-        """
+        """Capture the 37 step sub-graphs (1 + n_layers)."""
         if self.graphs is not None:
             return
         if self.m.device.type != "cuda":
@@ -393,16 +305,8 @@ class FastMossTTS:
             self.graphs.append(g)
         torch.cuda.synchronize()
 
-    # -------------------------------------------------------------- step --
     def step(self, row: torch.Tensor | None, pos: int, audio2: bool = False):
-        """Replay one decode step.
-
-        row [1,33]/[1,1,33] cuda long (None => ids_row already holds the row);
-        pos = 0-based cache slot this token occupies (== keys length after the
-        step); audio2=True selects the audio-phase final graph (2-way text
-        head).  Returns (lt [V] or None-written, la [32,1025], h [1,hidden],
-        two [2]) static buffers.
-        """
+        """Replay one decode step."""
         if self.graphs is None:
             raise RuntimeError("call capture() first")
         if row is not None:
@@ -420,35 +324,20 @@ class FastMossTTS:
         g[n + (1 if audio2 else 0)].replay()
         return self.lt_static, self.la_static, self.h_final, self.two_static
 
-
-# --------------------------------------------------------------- watchdog -
-# Calibrated against a 100-run W4 runaway corpus:
-# ch0 (coarsest RVQ code) values whose mean decoded frame energy across that
-# corpus is <= -45 dBFS (n >= 20 occurrences).
-# Consecutive raw ch0 runs of these codes: 3 known runaway generations hit
-# 190/204/319 frames; all 97 normal runs stay <= 44 (99th pct 44); golden bf16
-# zh/en <= 8.  Threshold 64 frames (5.12 s) sits 1.45x above the normal max
-# and 3x below the shortest runaway run.
 _WD_LOW_ENERGY_CH0 = frozenset(
     (9, 60, 109, 123, 163, 209, 216, 365, 399, 402, 421, 580, 715, 734,
      774, 795, 827, 888, 890, 936, 971, 996, 1001))
-# Max normal single-segment length in the corpus: 464 content frames (37.1 s).
-# Floor 640 (51.2 s) keeps 38% headroom; rule (b) additionally requires the
-# CURRENT tail to be silent (>= _WD_SEGMENT_BACKSTOP_RUN consecutive low-energy
-# ch0 frames, 2.56 s), so healthy long-form segments that keep producing sound
-# never trigger — only a long segment that has ALSO gone silent does.
+
 _WD_SEGMENT_FLOOR = 640
 _WD_SEGMENT_BACKSTOP_RUN = 32
-
 
 @dataclass
 class GenResultWatchdog(GenResult):
     """GenResult + watchdog metadata (isinstance(res, GenResult) holds)."""
 
     watchdog_triggered: bool = False
-    watchdog_reason: str = ""          # "silence" | "max_segment"
+    watchdog_reason: str = ""
     watchdog_stats: dict = field(default_factory=dict)
-
 
 @torch.inference_mode()
 def generate_fast(
@@ -470,12 +359,7 @@ def generate_fast(
     watchdog_max_segment_frames: int | None = None,
     max_requested_pause_s: float | None = None,
 ) -> GenResult:
-    """Delay-pattern generation on top of FastMossTTS.
-
-    Semantics mirror moss_tts_lite.generate for batch=1 exactly (same sampling
-    calls, same RNG stream); the state bookkeeping uses host scalars, which
-    for batch=1 is a value-identical re-expression of the tensor ops.
-    """
+    """Delay-pattern generation on top of FastMossTTS."""
     model = fast.m
     input_ids = prompt["input_ids"]
     attention_mask = prompt.get("attention_mask")
@@ -530,7 +414,6 @@ def generate_fast(
 
     torch.manual_seed(seed)
 
-    # ---- host-scalar state (batch=1) --------------------------------------
     col0 = input_ids[0, :, 0]
     last0 = int(col0[-1])
     is_continuation = last0 in (AUDIO_START_TOKEN_ID, AUDIO_GEN_SLOT_TOKEN_ID)
@@ -549,19 +432,9 @@ def generate_fast(
     text_steps: list = []
     audio_steps: list = []
     n_steps = 0
-    pos = seq_len       # cache slot the next fed token occupies
+    pos = seq_len
     captured = False
 
-    # ---- production watchdog (fast path only; exact path untouched) -------
-    # Detects the "non-terminating near-silence" runaway:
-    #   (a) >= watchdog_silence_frames consecutive fully-sampled audio rows
-    #       whose ch0 code is in the calibrated low-energy set;
-    #   (b) current segment length al > max(floor, 2 x longest completed
-    #       segment) — backstop for runaways that never go quiet.
-    # On trigger the delay-pattern end sequence is injected (32 x DELAY_SLOT
-    # text tokens -> AUDIO_END), which is exactly the model's own
-    # delayed_lengths == n_vq closing path, so the emitted rows stay legal
-    # codec input (staircase pad ramp + separator row).
     wd_stop = False
     wd_reason = ""
     wd_silent_run = 0
@@ -569,19 +442,17 @@ def generate_fast(
     wd_stats: dict = {}
     wd_floor = (watchdog_max_segment_frames if watchdog_max_segment_frames
                 is not None else _WD_SEGMENT_FLOOR)
-    # Rule (a) effective threshold: auto 64, or the explicit override, raised
-    # to cover user-requested pauses ([pause Xs] in the input text) with a
-    # 2 s margin (natural pre/post-pause decay + 1-frame granularity).
+
     wd_sil = watchdog_silence_frames if watchdog_silence_frames is not None else 64
     if max_requested_pause_s is not None and max_requested_pause_s > 0:
         wd_sil = max(wd_sil, math.ceil((max_requested_pause_s + 2.0) * 12.5))
 
     for time_step in range(max_new_tokens):
-        # ---- forward ------------------------------------------------------
+
         e0 = _t0()
         if time_step == 0:
             hs = fast.prefill(input_ids)
-            h = hs.last_hidden[:, -1]              # [1, hidden]
+            h = hs.last_hidden[:, -1]
             lt_step = la_step = two_step = None
             if not captured:
                 fast.capture()
@@ -591,13 +462,12 @@ def generate_fast(
             pos += 1
         _t1(e0, "prefill" if time_step == 0 else "step")
 
-        # ---- text token decision (mirror of generate.py) -------------------
         next_text = PAD_TOKEN_ID
         if wd_stop:
-            # forced close: replay the model's own end-of-sequence ramp
+
             if dl == _INT64_MAX or dl < N_VQ:
                 next_text = AUDIO_DELAY_SLOT_TOKEN_ID
-            else:                       # dl == N_VQ
+            else:
                 next_text = AUDIO_END_TOKEN_ID
                 is_audio = False
         elif not is_stopping and dl < N_VQ:
@@ -609,19 +479,17 @@ def generate_fast(
 
         if sampling_text:
             if is_audio and not text_do_sample:
-                # 2-way head; identical to the masked full-head argmax
+
                 two_raw = (two_step if two_step is not None
                            else F.linear(h[0], model.head_2way))
-                two = two_raw / text_temperature                        # [2] fresh
+                two = two_raw / text_temperature
                 if time_step == 0:
                     two[1] = float("-inf")
                 pick = int(torch.argmax(two))
                 next_text = (AUDIO_GEN_SLOT_TOKEN_ID if pick == 0
                              else AUDIO_DELAY_SLOT_TOKEN_ID)
             elif is_audio:
-                # audio phase + sampling: the full masked vector reproduced
-                # exactly via the bitwise-identical 2-way rows scattered into
-                # a -inf buffer -> same multinomial shape -> same RNG stream.
+
                 two_raw = (two_step if two_step is not None
                            else F.linear(h[0], model.head_2way))
                 lt_buf = fast.lt_buf
@@ -649,15 +517,12 @@ def generate_fast(
         if next_text == IM_END_TOKEN_ID:
             is_stopping = True
 
-        # ---- audio tokens --------------------------------------------------
-        # sampling channel set (host mirror of pre/post audio masks):
-        #   ch j samples iff  al > j  and  (dl == MAX or j > dl - 1)
         smask = [(al > j) and (dl == _INT64_MAX or j > dl - 1) for j in range(N_VQ)]
         next_audio_tokens = torch.full((1, N_VQ), AUDIO_PAD_CODE, device=device,
                                        dtype=torch.long)
         if any(smask):
             la = (la_step if la_step is not None else model.audio_logits(h))
-            audio_logit = la / audio_temperature             # [32, 1025] fresh
+            audio_logit = la / audio_temperature
             if smask[0]:
                 ch0 = audio_logit[0].view(1, -1)
                 ch0[..., AUDIO_PAD_CODE] = float("-inf")
@@ -669,7 +534,7 @@ def generate_fast(
                 next_audio_tokens[0, 0] = int(tok0[0])
             rest = [j for j in range(1, N_VQ) if smask[j]]
             if rest:
-                rest_l = audio_logit[rest]                    # [n2, 1025]
+                rest_l = audio_logit[rest]
                 rest_l[..., AUDIO_PAD_CODE] = float("-inf")
                 tok = sample_token(
                     logits=rest_l,
@@ -679,7 +544,6 @@ def generate_fast(
                 for k, j in enumerate(rest):
                     next_audio_tokens[0, j] = int(tok[k])
 
-        # ---- watchdog evaluation (fast path only) --------------------------
         ch0_val = int(next_audio_tokens[0, 0])
         if watchdog and not wd_stop and is_audio and dl == _INT64_MAX:
             if ch0_val in _WD_LOW_ENERGY_CH0:
@@ -699,7 +563,6 @@ def generate_fast(
                             "segment_bound_frames": seg_bound,
                             "max_requested_pause_s": max_requested_pause_s}
 
-        # ---- counters (exact reference order) ------------------------------
         if next_text in (AUDIO_START_TOKEN_ID, AUDIO_GEN_SLOT_TOKEN_ID,
                          AUDIO_DELAY_SLOT_TOKEN_ID):
             al += 1
@@ -714,7 +577,6 @@ def generate_fast(
         if dl > N_VQ:
             dl = _INT64_MAX
 
-        # ---- next input row -------------------------------------------------
         next_text_token = torch.full((1,), next_text, device=device, dtype=torch.long)
         current_input_ids = torch.cat(
             [next_text_token[:, None, None], next_audio_tokens[:, None, :]], dim=2)

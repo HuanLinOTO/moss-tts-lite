@@ -1,25 +1,10 @@
-"""Fast-path tests: CUDA-graph tier (fast.py) and the native whole-step tier.
-
-Phase 0/1/2 M1 gates (bitwise step parity, golden-exact trajectory,
-speed) plus the fast-native A/B/C gates: n1 bitwise vs fast.py, the
-n2 quality floor, and regressions for the three bugs found while
-building it.  GPU, under the lock.
-
-Consolidated from:
-  test_fast.py
-  test_fast_native.py
-
-Run:
-  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_fast.py
-"""
+"""Fast-path tests:"""
 
 from __future__ import annotations
 
 import os
 import sys
 
-# `python3 tests/<this file>.py` straight from the repo root must import
-# moss_tts_lite without an explicit PYTHONPATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -42,14 +27,9 @@ from moss_tts_lite.model import N_VQ, MossTTSModel
 
 try:
     from moss_tts_lite.st_loader import read_safetensors
-except ImportError:  # pragma: no cover
+except ImportError:
     from tests._mini_loader import read_safetensors_min as read_safetensors
 
-# --------------------------------------------------------------------------- #
-# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
-# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
-# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
-# --------------------------------------------------------------------------- #
 ROOT = os.environ.get("MOSS_TTS_ROOT",
                       os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
@@ -57,15 +37,10 @@ GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 STATE = os.path.join(MODEL_DIR, "gptq", "w1p.pt")
 SEED = 1234
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_fast.py ----
-# ------------------------------------------------------------------------- #
 try:
     from moss_tts_lite.st_loader import read_safetensors
-except ImportError:  # pragma: no cover
+except ImportError:
     from tests._mini_loader import read_safetensors_min as read_safetensors
-
 
 TEXT_TEMPERATURE = 1.5
 TEXT_TOP_P = 1.0
@@ -75,11 +50,9 @@ AUDIO_TOP_P = 0.8
 AUDIO_TOP_K = 25
 AUDIO_REPETITION_PENALTY = 1.0
 
-
 def _steps_ps(step_ms, skip=0):
     ms = step_ms[skip:]
     return 1000.0 / (sum(ms) / len(ms)) if ms else float("nan")
-
 
 def phase0(model, fast, ids):
     print("=== Phase 0: bitwise step parity (graph replay vs eager) ===")
@@ -87,8 +60,8 @@ def phase0(model, fast, ids):
         hs = model.prefill(ids)
         L0 = int(model.seq_len)
         fast.capture()
-        # feed the prompt's own tail tokens as teacher-forced rows
-        rows = ids[0, -6:].clone()   # [6, 33]
+
+        rows = ids[0, -6:].clone()
         lt_e, la_e, h_e = [], [], []
         for t in range(rows.shape[0]):
             hs = model.step(rows[t].view(1, 1, 33))
@@ -96,7 +69,7 @@ def phase0(model, fast, ids):
             lt_e.append(model.text_logits(h).clone())
             la_e.append(model.audio_logits(h).clone())
             h_e.append(h.clone())
-        # rewind: prefill again and replay with the fast path
+
         model.prefill(ids)
         lt_g, la_g, h_g = [], [], []
         pos = L0
@@ -119,11 +92,10 @@ def phase0(model, fast, ids):
     print(f"  phase0: {'PASS (bitwise)' if ok else 'FAIL'}")
     return ok
 
-
 def _run_case(model, fast, case, label, stats=None):
     from moss_tts_lite.generate import generate
     ids = case["input_ids"].cuda() if "input_ids" in case else case["ids"].cuda()
-    # prompt_golden entries: {"input_ids", "attention_mask", "name"}
+
     mask = case["attention_mask"].cuda() if "attention_mask" in case else None
     gt = case["generation_ids"]
     res = generate_fast(
@@ -150,7 +122,6 @@ def _run_case(model, fast, case, label, stats=None):
                    if t.reshape(-1)[j] != gt[j, 0] or not torch.equal(a[j], gt[j, 1:])), L)
         print(f"  [{label}] first diverging row {fd}")
     return res, exact
-
 
 def main_fast() -> int:
     assert torch.cuda.is_available()
@@ -193,7 +164,6 @@ def main_fast() -> int:
     print(f"VRAM peak after generations: "
           f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
-    # ---------- speed: rerun zh with per-step events ----------
     print("=== Phase 2: speed (zh, 137 steps) ===")
     stats: dict = {}
     res_s, ok_s = _run_case(model, fast, zh_case, "zh-speed", stats=stats)
@@ -212,25 +182,13 @@ def main_fast() -> int:
           f"-> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_fast_native.py ----
-# ------------------------------------------------------------------------- #
-
-
 _INT64_MAX = 9223372036854775807
 
-#: n2 gate: the shipped W4 path scores 75.39% on the same metric
-#: (tests/test_fast_m4 Phase A), so requiring 97% is a floor that both
-#: protects quality and would catch any real regression in the fused kernels.
 TOP25_GATE = 97.0
 TEXT_ARGMAX_GATE = 99.0
 
-
 def _fresh_base():
-    """A model + GPTQ fast container.  `load_gptq_fast` consumes the packed
-    payloads (`fuse_gemms` drops the per-name originals), so every arm needs
-    its own base -- reusing one across arms raises KeyError('q')."""
+    """A model + GPTQ fast container."""
     weights = read_safetensors(MODEL_DIR)
     model = MossTTSModel(weights, device=torch.device("cuda"),
                          dtype=torch.bfloat16, max_seq_len=8192)
@@ -239,17 +197,14 @@ def _fresh_base():
     torch.cuda.empty_cache()
     return model, base
 
-
 def _golden():
     pg = torch.load(os.path.join(GOLDEN, "prompt_golden.pt"),
                     map_location="cpu", weights_only=False)
     z = np.load(os.path.join(GOLDEN, "logits_golden.npz"))
     return pg, z
 
-
-# --------------------------------------------------------------- Phase A
 def phase_a(pg, n_positions=40, boundary=(690, 726)):
-    """n1 == fast.py, bitwise, over positions and across the gqa boundary."""
+    """n1 == fast."""
     print("=== Phase A: n1 bitwise vs fast.py ===")
     ids = pg["input_ids"][[c["name"] for c in pg["cases"]].index("zh_plain")].cuda()
     row = ids[0, -1:].view(1, 1, 33)
@@ -260,14 +215,14 @@ def phase_a(pg, n_positions=40, boundary=(690, 726)):
     ok = True
     worst = 0.0
     with torch.inference_mode():
-        # --- both phases, a run of positions -------------------------------
+
         hs = nat.prefill(ids)
         base.prefill(ids)
         base.capture()
         for t in range(n_positions):
             pos = L0 + t
             for audio2 in (False, True):
-                # reference: fast.py's own pieces at the same position/row
+
                 base.ids_row.copy_(row)
                 base.pos_dev.fill_(pos)
                 base._p_embed()
@@ -295,8 +250,7 @@ def phase_a(pg, n_positions=40, boundary=(690, 726)):
                        base.la_static.clone())
                 nat.replay(pos, audio2=audio2, row=row)
                 got = (nat.lt_buf, nat.two_buf, nat.la_buf)
-                # the pad column is -inf in both streams (-inf - -inf = nan),
-                # so compare the real 1024 codes and the pad column separately
+
                 for a, b in ((ref[0], got[0]), (ref[1], got[1]),
                              (ref[2][..., :1024], got[2][..., :1024])):
                     d = (a.float() - b.float()).abs().max().item()
@@ -307,7 +261,6 @@ def phase_a(pg, n_positions=40, boundary=(690, 726)):
         print(f"  {n_positions} positions x 2 phases: text/two/audio all "
               f"max|d| = {worst:.1e}  ->  {'PASS' if ok else 'FAIL'}")
 
-        # --- across the gqa_max_len switch (len 641 changes flash tiling) ---
         bad = 0
         for pos in range(boundary[0], boundary[1]):
             base.ids_row.copy_(row)
@@ -346,10 +299,8 @@ def phase_a(pg, n_positions=40, boundary=(690, 726)):
     torch.cuda.empty_cache()
     return ok
 
-
-# --------------------------------------------------------------- Phase B
 def phase_b(pg, z):
-    """n2 gates: teacher-forced quality, no runaway, normal termination."""
+    """n2 gates:"""
     print("=== Phase B: n2 quality gate ===")
     gt_text = torch.from_numpy(z["logits_text"]).cuda()
     gt_audio = torch.from_numpy(z["logits_audio"]).cuda()[..., :1024]
@@ -380,10 +331,6 @@ def phase_b(pg, z):
           f"(gate>={TOP25_GATE:.0f})")
     ok = argmax >= TEXT_ARGMAX_GATE and top25 >= TOP25_GATE
 
-    # ---- generation: termination, watchdog, sane length -------------------
-    # Both languages, both arms.  fast.py's own counts are the reference for
-    # "normal termination"; n2 may differ (different kernels, different
-    # utterance) but must stay in the same ballpark and must not loop.
     del nat, base, model
     torch.cuda.empty_cache()
     model, base = _fresh_base()
@@ -405,8 +352,7 @@ def phase_b(pg, z):
             r = generate_native(nat, {"input_ids": pg["input_ids"][names.index(case)].cuda()},
                                 max_new_tokens=4096, seed=SEED)
             n_ref = ref_steps[case]
-            # a runaway shows up as a step count far past the reference; the
-            # 2x bound is loose on purpose (n2 decodes a different utterance)
+
             sane = r.finished and not r.watchdog_triggered \
                 and r.n_steps <= 2 * n_ref and r.audio_frames.shape[0] > 0
             print(f"  [{arm}] {case:13s} steps={r.n_steps:4d} "
@@ -417,8 +363,6 @@ def phase_b(pg, z):
         torch.cuda.empty_cache()
     return ok
 
-
-# --------------------------------------------------------------- Phase C
 def phase_c(pg):
     """Behavioural regressions for the three bugs (see the module docstring)."""
     print("=== Phase C: bug regressions ===")
@@ -428,26 +372,12 @@ def phase_c(pg):
     L0 = int(ids.shape[1])
     ok = True
 
-    # ---- C1: the loop must consume the graph's fresh head readouts --------
-    # The bug: in the audio phase only `two_buf` was taken, so `la_step` stayed
-    # None and `generate_native` fell back to `model.audio_logits(h)` -- which
-    # recomputes the audio heads from the hidden state, and after the prefill
-    # step that hidden state is stale (it is not carried by the native loop at
-    # all).  Result: every audio row was wrong from step 1 while the text
-    # stream stayed right until step 105.
-    #
-    # This is asserted on the *consumption* path, not on the buffer: the whole
-    # point of the whole-step graph is that it computes every head, so the loop
-    # must never recompute an audio head.  `audio_logits` is therefore made to
-    # raise, and generation must still succeed -- reintroducing the fallback
-    # makes it raise.  (`text_logits` is left alone: the loop legitimately
-    # calls it once at time_step 0.)
     model, base = _fresh_base()
     nat = FastNativeTTS(base, arm="n1", max_graphs=64)
     calls = {"audio_logits": 0}
     real_audio_logits = MossTTSModel.audio_logits
 
-    def _forbid_audio_logits(self, h):                     # noqa: ANN001
+    def _forbid_audio_logits(self, h):                       # noqa: ANN001
         calls["audio_logits"] += 1
         raise AssertionError(
             "generate_native() recomputed audio heads instead of using the "
@@ -463,8 +393,7 @@ def phase_c(pg):
         r = None
     finally:
         MossTTSModel.audio_logits = real_audio_logits
-    # also assert the buffers the loop relies on are present and genuinely
-    # different from the stale-prefill values (so the fallback is detectable)
+
     with torch.inference_mode():
         hs_pre = nat.prefill(ids)
         prefill_la = model.audio_logits(hs_pre.last_hidden[:, -1]).float()[..., :1024]
@@ -484,22 +413,13 @@ def phase_c(pg):
     del nat, base, model
     torch.cuda.empty_cache()
 
-    # ---- C2: prefill uses the reference rms_norm chain --------------------
-    # prefill must be bitwise-equal to fast.py's own quantized prefill, because
-    # it fixes the KV cache for the whole decode.  A fast-norm prefill shows up
-    # here as a nonzero hidden/KV difference (measured 5.0 / 2.0).
-    #
-    # Order matters: `FastNativeTTS(arm="n2")` fuses `(q,k)` and `(gate,up)`
-    # and drops the per-name payloads, after which `base.prefill()` can no
-    # longer run (KeyError 'q').  So take the reference prefill FIRST, from the
-    # untouched base, and only then build the native object.
     model, base = _fresh_base()
     with torch.inference_mode():
         hs_ref = base.prefill(ids)
         ref_h = hs_ref.last_hidden.clone()
         ref_k = model.k_cache[:, :, :L0].clone()
         ref_v = model.v_cache[:, :, :L0].clone()
-        nat = FastNativeTTS(base, arm="n2", max_graphs=64)   # n2 = risky arm
+        nat = FastNativeTTS(base, arm="n2", max_graphs=64)
         hs = nat.prefill(ids)
         d_h = (ref_h.float() - hs.last_hidden.float()).abs().max().item()
         d_k = (ref_k.float() - model.k_cache[:, :, :L0].float()).abs().max().item()
@@ -511,21 +431,6 @@ def phase_c(pg):
     del nat, base, model
     torch.cuda.empty_cache()
 
-    # ---- C3: the delay-ramp decision must match fast.py branch for branch -
-    # The bug: the two forced branches (`dl < N_VQ` -> delay slot,
-    # `dl == N_VQ` -> audio end) were taken unconditionally, dropping
-    # `fast.py`'s `not is_stopping` guards.  Once `IM_END` has been decided the
-    # reference stops forcing, and `sampling_text` also switches the whole
-    # sampling block off -- so an unguarded implementation keeps forcing, and
-    # (`sampling_text` disagreeing) keeps consuming RNG where the reference
-    # does not.
-    #
-    # Pinned as a *differential* table against `fast.py`'s own branch text:
-    # `_reference_text_decision` below is a transcription of
-    # `generate_fast`'s `if wd_stop / elif not is_stopping and ...` block, and
-    # every combination in the cross product must agree on all four outputs.
-    # This is exact and cheap (no GPU), and it fails immediately if either side
-    # changes -- which is the property a step-count assertion cannot give.
     bad = []
     for dl in (_INT64_MAX, N_VQ - 1, N_VQ, N_VQ + 1):
         for wd_stop in (False, True):
@@ -544,7 +449,6 @@ def phase_c(pg):
               f"stop={row[2]} audio={row[3]}: mine={row[4]} ref={row[5]}")
     ok &= c3_ok
 
-    # the guards must actually be reachable: the unguarded variant differs
     unguarded_differs = any(
         (_unguarded_text_decision(dl, N_VQ, wd_stop, is_stopping, is_audio)
          != text_decision(dl, N_VQ, wd_stop, is_stopping, is_audio))
@@ -555,7 +459,6 @@ def phase_c(pg):
           f"{unguarded_differs}  ->  {'PASS' if unguarded_differs else 'FAIL'}")
     ok &= unguarded_differs
 
-    # and the audio mask helper must agree with the reference expression
     mask_bad = 0
     for al in (0, 1, N_VQ - 1, N_VQ, N_VQ + 3):
         for dl in (_INT64_MAX, 0, 1, N_VQ - 1, N_VQ, N_VQ + 1):
@@ -568,14 +471,8 @@ def phase_c(pg):
     ok &= mask_bad == 0
     return ok
 
-
 def _reference_text_decision(dl, n_vq, wd_stop, is_stopping, is_audio):
-    """`generate_fast`'s text-decision block, transcribed verbatim.
-
-    Kept literally in the shape of `fast.py` (one branch per line, same order)
-    so a reader can diff it against the source by eye; the test asserts the
-    module's `text_decision` agrees with it over the whole state cross product.
-    """
+    """`generate_fast`'s text-decision block, transcribed verbatim."""
     next_text = PAD_TOKEN_ID
     if wd_stop:
         if dl == _INT64_MAX or dl < n_vq:
@@ -592,13 +489,8 @@ def _reference_text_decision(dl, n_vq, wd_stop, is_stopping, is_audio):
     forced = next_text in (AUDIO_DELAY_SLOT_TOKEN_ID, AUDIO_END_TOKEN_ID)
     return next_text, is_audio, sampling_text, forced
 
-
 def _unguarded_text_decision(dl, n_vq, wd_stop, is_stopping, is_audio):
-    """The buggy variant: the same block without `not is_stopping`.
-
-    Used only to prove the guards are observable; it must NOT match the
-    reference for at least one state (the C3 pre-condition).
-    """
+    """The buggy variant:"""
     next_text = PAD_TOKEN_ID
     if wd_stop:
         if dl == _INT64_MAX or dl < n_vq:
@@ -606,15 +498,14 @@ def _unguarded_text_decision(dl, n_vq, wd_stop, is_stopping, is_audio):
         else:
             next_text = AUDIO_END_TOKEN_ID
             is_audio = False
-    elif dl < n_vq:                       # guard dropped
+    elif dl < n_vq:
         next_text = AUDIO_DELAY_SLOT_TOKEN_ID
-    elif dl == n_vq:                      # guard dropped
+    elif dl == n_vq:
         next_text = AUDIO_END_TOKEN_ID
         is_audio = False
     sampling_text = (not is_stopping) and (not wd_stop) and dl > n_vq
     forced = next_text in (AUDIO_DELAY_SLOT_TOKEN_ID, AUDIO_END_TOKEN_ID)
     return next_text, is_audio, sampling_text, forced
-
 
 def main_fast_native() -> int:
     assert torch.cuda.is_available()
@@ -636,18 +527,12 @@ def main_fast_native() -> int:
           f"peak={vram:.2f} GiB -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
-
-# --------------------------------------------------------------------------- #
-# Unified entry point: each source file's own entry function, in order.
-# --------------------------------------------------------------------------- #
-
 def main() -> int:
     rc = 0
     rc |= main_fast() or 0
     rc |= main_fast_native() or 0
 
     return rc
-
 
 if __name__ == "__main__":
     sys.exit(main())

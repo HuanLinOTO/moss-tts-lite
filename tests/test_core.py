@@ -1,26 +1,10 @@
-"""Core model tests: weight loader, forward pass, sampling.
-
-``read_safetensors`` against synthetic and real checkpoint files, the
-MossTTSModel prefill/decode contract on real bf16 weights (GPU,
-~17.5 GB, run under the GPU lock), and op-for-op sampling parity with
-the reference ``inference_utils.py`` (CPU).
-
-Consolidated from:
-  test_model.py
-  test_sampling.py
-  test_st_loader.py
-
-Run:
-  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_core.py
-"""
+"""Core model tests:"""
 
 from __future__ import annotations
 
 import os
 import sys
 
-# `python3 tests/<this file>.py` straight from the repo root must import
-# moss_tts_lite without an explicit PYTHONPATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import json
@@ -44,27 +28,15 @@ from moss_tts_lite.sampling import (
 )
 from moss_tts_lite.st_loader import safetensors_header
 
-try:  # prefer the real loader (tok-delivered); fall back to the temp mini one
+try:
     from moss_tts_lite.st_loader import read_safetensors
 except ImportError:
     from tests._mini_loader import read_safetensors_min as read_safetensors
 from tests._mini_bpe import build_tts_prompt_dev
 
-# --------------------------------------------------------------------------- #
-# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
-# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
-# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
-# --------------------------------------------------------------------------- #
 ROOT = os.environ.get("MOSS_TTS_ROOT",
                       os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
-
-
-# ------------------------------------------------------------------------- #
-# ---- from test_model.py ----
-# ------------------------------------------------------------------------- #
-
-
 
 def main_model():
     dev = torch.device("cuda")
@@ -85,7 +57,6 @@ def main_model():
     L = ids.shape[1]
     print("prompt L =", L)
 
-    # ---- prefill ----
     hs = model.prefill(ids)
     h = hs.last_hidden
     assert h.shape == (1, L, 4096), h.shape
@@ -94,8 +65,7 @@ def main_model():
     print(f"prefill hidden: shape {tuple(h.shape)}, finite OK, "
           f"mean|h|={h.float().abs().mean():.4f}, max|h|={h.float().abs().max():.4f}")
 
-    # ---- heads on last position ----
-    h_last = h[:, -1]  # [1, 4096]
+    h_last = h[:, -1]
     lt = model.text_logits(h_last)
     assert lt.shape == (155648,), lt.shape
     assert torch.isfinite(lt.float()).all(), "NaN/Inf in text logits"
@@ -111,13 +81,10 @@ def main_model():
     assert top_audio != AUDIO_PAD_CODE
     print(f"audio ch0 logits: argmax={top_audio}, max={la0.max().item():.3f}")
 
-    # 2-way head vs full head (greedy equivalence precondition)
     two = model.text_logits_2way(h_last)
     assert two.shape == (2,)
     assert int(two.argmax()) == (0 if int(lt[AUDIO_GEN_SLOT_TOKEN_ID]) > int(lt[151662]) else 1)
 
-    # ---- causal sanity (same-shape test): changing tokens >= k must not change
-    # hidden[:k] bitwise (same kernels -> no shape-induced rounding drift) ----
     k = L - 5
     ids2 = ids.clone()
     ids2[0, k:, 0] = (ids2[0, k:, 0] + 1) % 1000
@@ -125,17 +92,16 @@ def main_model():
     d = (hs2.last_hidden[0, :k] - h[0, :k]).abs().max().item()
     assert d == 0.0, f"causality violated: max|d|={d}"
     print(f"causality check (suffix tokens mutated, same shape): max|d| = {d}")
-    # informational: cross-shape prefill (L vs L-5) differs only by bf16 kernel-tiling noise
+
     hs3 = model.prefill(ids[:, :k])
     d2 = (hs3.last_hidden[0] - h[0, :k]).abs().max().item()
     print(f"cross-shape prefix diff (bf16 kernel noise, informational): max|d| = {d2:.4f}")
 
-    # ---- 40 decode steps ----
     model.reset()
     hs = model.prefill(ids)
     for t in range(40):
         row = torch.full((1, 33), AUDIO_PAD_CODE, dtype=torch.long, device=dev)
-        row[0, 0] = 151662 if t % 2 == 0 else 151656  # delay_slot / gen_slot
+        row[0, 0] = 151662 if t % 2 == 0 else 151656
         row[0, 1:] = torch.randint(0, 1024, (32,), device=dev)
         hs = model.step(row)
         assert hs.last_hidden.shape == (1, 1, 4096)
@@ -150,14 +116,6 @@ def main_model():
           f"peak={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
     print("test_model PASS")
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_sampling.py ----
-# ------------------------------------------------------------------------- #
-
-# ---- exact copies of models/MOSS-TTS-v1.5/inference_utils.py ----
-
-
 def ref_apply_top_k(logits, top_k):
     batch_size, vocab_size = logits.shape
     top_k = min(top_k, vocab_size)
@@ -166,7 +124,6 @@ def ref_apply_top_k(logits, top_k):
     batch_indices = torch.arange(batch_size).unsqueeze(-1)
     filtered_logits[batch_indices, top_k_indices] = top_k_values
     return filtered_logits
-
 
 def ref_apply_top_p(logits, top_p):
     probs = F.softmax(logits, dim=-1)
@@ -181,7 +138,6 @@ def ref_apply_top_p(logits, top_p):
         indices_to_remove = sorted_indices[i][sorted_indices_to_remove[i]]
         filtered_logits[i, indices_to_remove] = float("-inf")
     return filtered_logits
-
 
 def ref_apply_repetition_penalty_delay_pattern(logits, prev_tokens, penalty):
     if penalty == 1.0 or prev_tokens is None:
@@ -209,7 +165,6 @@ def ref_apply_repetition_penalty_delay_pattern(logits, prev_tokens, penalty):
         logits[:, h, unique_tokens] = token_logits
     return logits
 
-
 def ref_sample_token(logits, prev_tokens=None, repetition_penalty=1.0,
                      top_p=None, top_k=None, do_sample=True):
     vocab_size = logits.size(-1)
@@ -227,17 +182,14 @@ def ref_sample_token(logits, prev_tokens=None, repetition_penalty=1.0,
     next_tokens = torch.multinomial(probs, num_samples=1)
     return next_tokens.view(original_shape[:-1])
 
-
 def main_sampling():
     torch.manual_seed(0)
 
-    # ---- top_k ----
     x = torch.randn(4, 100)
     assert torch.equal(apply_top_k(x, 7), ref_apply_top_k(x, 7))
     assert torch.equal(apply_top_k(x, 500), ref_apply_top_k(x, 500))
     print("apply_top_k: exact match")
 
-    # ---- top_p (loop version == optimized version == port) ----
     x = torch.randn(4, 100)
     assert torch.equal(apply_top_p(x.clone(), 0.9), ref_apply_top_p(x.clone(), 0.9))
     x2 = torch.randn(4, 100)
@@ -246,7 +198,6 @@ def main_sampling():
     assert torch.equal(apply_top_p(x2, 0.5), ref_apply_top_p(x2, 0.5))
     print("apply_top_p: exact match (loop == optimized == port)")
 
-    # ---- repetition penalty 3D ----
     lg = torch.randn(1, 8, 50)
     pv = torch.randint(0, 50, (1, 20, 8))
     out = apply_repetition_penalty_delay_pattern(lg.clone(), pv, 1.2)
@@ -254,7 +205,6 @@ def main_sampling():
     assert torch.equal(out, ref)
     print("repetition_penalty [B,H,V]: exact match")
 
-    # ---- repetition penalty 2D (text) ----
     lg = torch.randn(1, 200)
     pv = torch.randint(0, 200, (1, 30))
     out = apply_repetition_penalty_delay_pattern(lg.clone(), pv, 1.3)
@@ -262,11 +212,10 @@ def main_sampling():
     assert torch.equal(out, ref)
     print("repetition_penalty [N,V]: exact match")
 
-    # ---- sample_token, greedy ----
     lg = torch.randn(1, 50)
     assert torch.equal(sample_token(lg, do_sample=False),
                        ref_sample_token(lg, do_sample=False))
-    # ---- sample_token, sampled, all arg combos ----
+
     for (tk, tp) in [(None, None), (25, 0.8), (50, 1.0), (None, 0.95), (5, None)]:
         for rep in (1.0, 1.2):
             torch.manual_seed(42)
@@ -276,7 +225,7 @@ def main_sampling():
             b = ref_sample_token(lg.clone(), prev_tokens=torch.randint(0, 50, (1, 9)),
                                  repetition_penalty=rep, top_p=tp, top_k=tk, do_sample=True)
             assert torch.equal(a, b), (tk, tp, rep, a, b)
-    # ---- audio-shaped [N, V] batch of heads, same RNG stream ----
+
     lg3 = torch.randn(31, 1025)
     pv3 = torch.randint(0, 1025, (1, 77, 32))
     torch.manual_seed(7)
@@ -288,7 +237,6 @@ def main_sampling():
     assert torch.equal(a, b)
     print("sample_token: exact RNG-stream match across arg combos")
 
-    # ---- find_last_equal_C ----
     t = torch.tensor([[5, 3, 7, 3, 9]])
     assert find_last_equal_C(t, 3).item() == 3
     assert find_last_equal_C(t, 9).item() == 4
@@ -297,22 +245,13 @@ def main_sampling():
 
     print("test_sampling PASS")
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_st_loader.py ----
-# ------------------------------------------------------------------------- #
-
-
-
 def _np_dtype(st_dt: str) -> np.dtype:
     return {"BF16": np.uint16, "F32": np.float32, "F16": np.float16,
             "I64": np.int64, "F64": np.float64}[st_dt]
 
-
 def _torch_dtype(st_dt: str) -> torch.dtype:
     return {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16,
             "I64": torch.int64, "F64": torch.float64}[st_dt]
-
 
 def _write_safetensors(path: str, tensors: dict[str, tuple[list[int], str,
                                                            np.ndarray]]) -> None:
@@ -336,7 +275,6 @@ def _write_safetensors(path: str, tensors: dict[str, tuple[list[int], str,
         for b in blobs:
             f.write(b)
 
-
 def test_single_file_all_dtypes():
     """Synthetic single file covering bf16/fp16/fp32/int64 + non-contiguous offsets."""
     rng = np.random.default_rng(0)
@@ -359,27 +297,25 @@ def test_single_file_all_dtypes():
         assert got["w_f16"].dtype == torch.float16
         assert got["w_i64"].dtype == torch.int64
         assert list(got["w_bf16"].shape) == [4, 3]
-        # bf16: bitwise round-trip through raw uint16 view
+
         assert torch.equal(
             got["w_bf16"].view(torch.uint16),
             torch.from_numpy(bf16_raw.reshape(4, 3)))
-        # fp32 exact, fp16 exact, int64 exact
+
         assert torch.equal(got["w_f32"], torch.from_numpy(f32))
         assert torch.equal(got["w_f16"], torch.from_numpy(f16))
         assert torch.equal(got["w_i64"], torch.from_numpy(i64))
-        # explicit dtype conversion
+
         got32 = read_safetensors(p, dtype=torch.float32)
         assert got32["w_bf16"].dtype == torch.float32
         expect = torch.from_numpy(bf16_raw.view(np.uint16)).view(torch.bfloat16).to(torch.float32)
         assert torch.equal(got32["w_bf16"], expect)
         print("  single-file all-dtypes: OK (bf16 bitwise, f32/f16/i64 exact)")
 
-
 def _header_len_bytes(path: str) -> int:
     with open(path, "rb") as f:
         (n,) = struct.unpack("<Q", f.read(8))
     return int(n)
-
 
 def test_mmap_zero_copy_and_readonly():
     with tempfile.TemporaryDirectory() as td:
@@ -389,19 +325,17 @@ def test_mmap_zero_copy_and_readonly():
         got = read_safetensors(p)
         t = got["t"]
         assert t.untyped_storage().nbytes() >= 96
-        # backed by mmap: modifying the tensor's bytes in the file is visible
+
         data_start = 8 + _header_len_bytes(p)
         with open(p, "r+b") as f:
             f.seek(data_start)
             f.write(struct.pack("<q", 4242))
         assert int(t[0]) == 4242, "tensor should be a live mmap view"
-        # (No read-only assertion: torch permits in-place writes on mmap-backed
-        # tensors without autograd; same semantics as upstream safetensors loader.)
+
         print("  mmap zero-copy + read-only: OK (file write visible in tensor)")
 
-
 def test_sharded_index():
-    """Two shards + index.json; partial read must only touch needed shard."""
+    """Two shards + index."""
     rng = np.random.default_rng(1)
     with tempfile.TemporaryDirectory() as td:
         f1 = os.path.join(td, "model-00001-of-00002.safetensors")
@@ -422,11 +356,11 @@ def test_sharded_index():
         assert set(got) == {"a.weight", "b.weight", "c.weight"}
         assert torch.equal(got["a.weight"], torch.from_numpy(a))
         assert torch.equal(got["c.weight"], torch.from_numpy(c))
-        # partial read
+
         part = read_safetensors(td, names=["c.weight"])
         assert set(part) == {"c.weight"}
         assert torch.equal(part["c.weight"], torch.from_numpy(c))
-        # unknown key must raise
+
         try:
             read_safetensors(td, names=["nope.weight"])
             raise AssertionError("expected KeyError")
@@ -434,9 +368,8 @@ def test_sharded_index():
             pass
         print("  sharded index + partial read: OK")
 
-
 def test_moss_v15_checkpoint():
-    """Read 5 tensors from the real MOSS-TTS-v1.5 checkpoint; validate against index."""
+    """Read 5 tensors from the real MOSS-TTS-v1."""
     if not os.path.isdir(MODEL_DIR):
         print("  [skip] models/MOSS-TTS-v1.5 not present")
         return
@@ -449,7 +382,6 @@ def test_moss_v15_checkpoint():
     assert len(picks) == 5, f"expected 5 known tensors, got {picks}"
     got = read_safetensors(MODEL_DIR, names=picks)
 
-    # shape/dtype must match each shard's header exactly
     shard_headers = {}
     for name in picks:
         shard = os.path.join(MODEL_DIR, weight_map[name])
@@ -458,13 +390,13 @@ def test_moss_v15_checkpoint():
         info = shard_headers[shard][name]
         assert list(got[name].shape) == info["shape"], (name, got[name].shape, info["shape"])
         assert got[name].dtype == _torch_dtype(info["dtype"]), (name, got[name].dtype)
-    # cross-check with index json (types present)
+
     with open(os.path.join(MODEL_DIR, "config.json")) as f:
         cfg = json.load(f)
     hid = cfg.get("hidden_size") or cfg.get("text_config", {}).get("hidden_size", 4096)
     assert got["emb_ext.0.weight"].shape == (1025, hid)
     assert got["lm_heads.32.weight"].shape == (1025, hid)
-    # numerics: finite, embed_tokens norm sane
+
     e = got["language_model.embed_tokens.weight"].float()
     assert torch.isfinite(e).all()
     rms = e.pow(2).mean().sqrt().item()
@@ -474,13 +406,10 @@ def test_moss_v15_checkpoint():
     assert q.std().item() > 0
     h = got["language_model.norm.weight"].float()
     assert torch.isfinite(h).all()
-    assert h.std().item() > 0  # trained RMSNorm weights hover near 1, may dip < 0
+    assert h.std().item() > 0
     print(f"  MOSS-TTS-v1.5: 5 tensors OK; embed {tuple(e.shape)} rms={rms:.4f}; "
           f"q_proj {tuple(q.shape)} std={q.std().item():.4f}; "
           f"norm.weight range [{h.min().item():.4f}, {h.max().item():.4f}]")
-
-
-
 
 def main_st_loader() -> int:
     print(f"[{os.path.basename(__file__)}]")
@@ -491,11 +420,6 @@ def main_st_loader() -> int:
     print("ALL TESTS PASSED")
     return 0
 
-
-# --------------------------------------------------------------------------- #
-# Unified entry point: each source file's own entry function, in order.
-# --------------------------------------------------------------------------- #
-
 def main() -> int:
     rc = 0
     rc |= main_model() or 0
@@ -503,7 +427,6 @@ def main() -> int:
     rc |= main_st_loader() or 0
 
     return rc
-
 
 if __name__ == "__main__":
     sys.exit(main())

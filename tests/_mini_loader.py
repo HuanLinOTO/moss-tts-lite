@@ -1,9 +1,4 @@
-"""TEMPORARY minimal safetensors reader for tts-agent self-tests.
-
-Will be replaced by `moss_tts_lite.st_loader.read_safetensors` once delivered;
-tests prefer the real loader and fall back to this one.  Not imported by any
-moss_tts_lite runtime module.
-"""
+"""TEMPORARY minimal safetensors reader for tts-agent self-tests."""
 
 import json
 import mmap
@@ -18,12 +13,10 @@ _DT = {
     "F64": torch.float64, "I64": torch.int64, "I32": torch.int32,
     "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
 }
-_KEEPALIVE = []  # keep mmaps alive for the lifetime of the tensors
-
+_KEEPALIVE = []
 
 def read_safetensors_min(path, dtype=None):
-    """Read one .safetensors file or a sharded dir (with index.json) into
-    {name: torch.Tensor} on CPU. dtype=None keeps the on-disk dtype."""
+    """Read one ."""
     p = Path(path)
     if p.is_dir():
         idx = json.loads((p / "model.safetensors.index.json").read_text())
@@ -33,7 +26,6 @@ def read_safetensors_min(path, dtype=None):
             out.update(_read_file(p / s, dtype))
         return out
     return _read_file(p, dtype)
-
 
 def _read_file(path, dtype):
     fh = open(path, "rb")

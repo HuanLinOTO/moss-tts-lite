@@ -1,11 +1,4 @@
-"""TEMPORARY prompt builder for tts-agent self-tests (smoke only).
-
-Byte-level BPE (Qwen2 pre-tokenizer semantics, ASCII classes) over
-vocab.json + merges.txt, wrapping the exact UserMessage template + chat
-template used by processing_moss_tts.build_user_message + apply_chat_template
-(generation prompt).  Only valid for pure-ASCII smoke texts; the real
-moss_tts_lite.prompt (tok) + golden assets replace this.
-"""
+"""TEMPORARY prompt builder for tts-agent self-tests (smoke only)."""
 
 import json
 import os
@@ -21,7 +14,6 @@ IM_START = 151644
 IM_END = 151645
 AUDIO_PAD_CODE = 1024
 
-# Qwen2 pre-tokenizer, ASCII classes (no unicode letters/digits in smoke texts)
 _PRETOK = re.compile(
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
     r"|[^\r\nA-Za-z0-9]?[A-Za-z]+"
@@ -31,7 +23,6 @@ _PRETOK = re.compile(
     r"|\s+(?!\S)"
     r"|\s+"
 )
-
 
 def _bytes_to_unicode():
     bs = (list(range(ord("!"), ord("~") + 1))
@@ -45,7 +36,6 @@ def _bytes_to_unicode():
             cs.append(256 + n)
             n += 1
     return dict(zip(bs, (chr(c) for c in cs)))
-
 
 class _MiniBPE:
     def __init__(self, model_dir=MODEL_DIR):
@@ -93,10 +83,8 @@ class _MiniBPE:
                     ids.extend(self._bpe(m))
         return ids
 
-
 def build_tts_prompt_dev(text: str, model_dir=MODEL_DIR):
-    """Direct-TTS generation prompt: UserMessage(None fields) + chat template
-    + <|im_start|>assistant\\n.  Returns {"input_ids": [1,L,33], "attention_mask": [1,L]}."""
+    """Direct-TTS generation prompt:"""
     bpe = _MiniBPE(model_dir)
     user_inst = ("<user_inst>\n- Reference(s):\nNone\n- Instruction:\nNone\n- Tokens:\nNone\n"
                  "- Quality:\nNone\n- Sound Event:\nNone\n- Ambient Sound:\nNone\n"
@@ -109,7 +97,6 @@ def build_tts_prompt_dev(text: str, model_dir=MODEL_DIR):
     input_ids[0, :, 1:] = AUDIO_PAD_CODE
     return {"input_ids": input_ids,
             "attention_mask": torch.ones(1, L, dtype=torch.bool)}
-
 
 if __name__ == "__main__":
     bpe = _MiniBPE()

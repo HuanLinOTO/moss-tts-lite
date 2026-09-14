@@ -1,0 +1,12 @@
+{
+ "/tmp/export_e2_407_u_r6/base/model.safetensors": {
+  "bytes": 35695856,
+  "mtime": 1789363047,
+  "sha256": "95d28d956abd27d1fd02f50c7384d132dd7beb698fe12b52fd7aea09de388970"
+ },
+ "/tmp/export_e2_407_u_r6/base/model.safetensors.index.json": {
+  "bytes": 4483,
+  "mtime": 1789363047,
+  "sha256": "7827258646e7fa89ae29c3bc59535bb85c398806707d98d42d671905c624e630"
+ }
+}

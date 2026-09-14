@@ -1,50 +1,4 @@
-"""Standalone (self-contained) export of a GPTQ-quantized MOSS-TTS checkpoint.
-
-Background
-----------
-`models/MOSS-TTS-v1.5/gptq/w1.pt` (the offline GPTQ state produced by
-the upstream GPTQ pipeline) holds *only* the packed
-int4 payloads; every other tensor (embeddings, the 33 heads, norms, the
-bf16-kept projections) still has to come from the 16.6 GB bf16 base
-checkpoint.  Downloading 16.6 GB to run an 8.3 GiB quantized model is a
-distribution problem, and it also needs the base directory to be laid out
-exactly like the upstream repo.
-
-This module turns that "base + patch" pair into one **self-contained model
-directory** that a user can download and use directly:
-
-    models_export/MOSS-TTS-v1.5-W4GPTQ-w1/
-        quantized.safetensors   int4-packed linears + all surviving bf16 tensors
-        meta.json               format/quant params, group sizes, provenance, metrics
-        README.md               model card (rendered from moss_tts_lite/README_hf.md)
-        config.json, tokenizer.json, vocab.json, merges.txt, ...  (copied verbatim)
-        LICENSE, .gitattributes
-
-Tensor format (no new runtime format is introduced)
----------------------------------------------------
-The packed tensors keep the exact layout, dtypes and semantics that
-`moss_tts_lite/fast.py` (`FastMossTTS._quantize`) already consumes, only the *keys*
-are flattened to the vocabulary this project uses for states:
-
-    layers.{i}.{proj}.q     int32   aten._convert_weight_to_int4pack output
-    layers.{i}.{proj}.qsz   bf16    [K//g, N, 2]  (scale, mn + 8*scale)
-
-Everything that is *not* a quantized projection keeps its original checkpoint
-key (`language_model.layers.{i}.self_attn.v_proj.weight`, `emb_ext.3.weight`,
-`lm_heads.17.weight`, ...) and its original bytes, so the exported file is a
-drop-in partial replacement for the base shards.  Consequence: assembling the
-runtime model never needs the base directory, and the assembled module is
-bit-identical to the current `base + w1.pt` path (see
-the upstream development workspace).
-
-No GPU is used by the exporter and no weight is materialized in RAM: the base
-shards are mmap'd with `st_loader.read_safetensors`, the state is mmap'd with
-`torch.load`, and the output is streamed tensor by tensor to disk.
-
-Purity: stdlib + torch + numpy only (the repo's dependency gate allows exactly
-torch/numpy/soundfile/yaml), which is why the safetensors writer below is
-hand-rolled instead of importing the `safetensors` package.
-"""
+"""Standalone (self-contained) export of a GPTQ-quantized MOSS-TTS checkpoint."""
 
 from __future__ import annotations
 
@@ -80,15 +34,11 @@ README_FILE = "README.md"
 DEFAULT_BASE_REPO = "OpenMOSS-Team/MOSS-TTS-v1.5"
 BASE_COLLECTION_MS = "OpenMOSS-Team/MOSS-TTS"
 
-# Small, non-quantized files copied verbatim into the export (model card,
-# tokenizer, config, reference modeling code, license).  Missing ones are
-# skipped with a warning: the TTS path itself only needs vocab.json,
-# merges.txt and tokenizer.json (moss_tts_lite/prompt.py).
 SMALL_FILES = (
-    # tokenizer (moss_tts_lite.bpe.QwenBPE + chat template)
+
     "vocab.json", "merges.txt", "tokenizer.json", "tokenizer_config.json",
     "added_tokens.json", "special_tokens_map.json", "chat_template.jinja",
-    # config / provenance
+
     "config.json", "configuration.json", "processor_config.json",
     "configuration_moss_tts.py", "modeling_moss_tts.py",
     "processing_moss_tts.py", "tts_robust_normalizer_single_script.py",
@@ -97,7 +47,6 @@ SMALL_FILES = (
 )
 LICENSE_FILE = "LICENSE"
 
-# proj name -> suffix of the original checkpoint key
 _PROJ = {
     "q": "self_attn.q_proj", "k": "self_attn.k_proj", "v": "self_attn.v_proj",
     "o": "self_attn.o_proj", "gate": "mlp.gate_proj", "up": "mlp.up_proj",
@@ -105,13 +54,8 @@ _PROJ = {
 }
 _Q_RE = re.compile(r"^layers\.(\d+)\.(" + "|".join(_LIN_NAMES) + r")\.(q|qsz)$")
 
-# .gitattributes for the exported directory (big file -> LFS on HF/MS).
 _GITATTRIBUTES_FALLBACK = "*.safetensors filter=lfs diff=lfs merge=lfs -text\n"
 
-# Measured metrics of the shipped presets (measured in the upstream
-# gates 1/2/4 on an A10G-24G, torch 2.9.1).  They are *documentation*: the
-# exporter records them in meta.json and the model card, it does not recompute
-# them; the acceptance harness lives in the upstream workspace).
 PRESET_METRICS: dict[str, dict] = {
     "w1": {
         "label": "default tier", "group_size": 32, "bf16_keeps": "v_proj (36 layers)",
@@ -130,10 +74,6 @@ PRESET_METRICS: dict[str, dict] = {
 METRICS_SOURCE = ("gates 1/2/4; A10G-24G, "
                   "torch 2.9.1; speed floor 78 steps/s, VRAM ceiling 12 GiB)")
 
-# Fallback "cross-language validation" section (langcheck-1). A preset may
-# override the whole block through --metrics-json (`cross_lang_section`) to add
-# its own level on the same corpus; the default keeps the shared result (10
-# languages x 4 trajectories) in every re-export of every preset.
 DEFAULT_CROSS_LANG_SECTION = r"""### 跨语言验证 / Cross-language validation
 
 基座声明支持 31 种语言；本档已在其中 **10 种语言 × 4 条轨迹 = 40 条轨迹**上完成 teacher-forced
@@ -159,12 +99,6 @@ the quantization acceptance documentation (langcheck-1) in the release repositor
 the other 21 of the 31 declared languages were not individually verified, and this result is not
 extrapolated to them.*"""
 
-# The tie-convention note is only meaningful for a preset that actually has a
-# tie-robust measurement (w2); it collapses to nothing for presets without one
-# (w1), which report the historical single-convention gate number instead.
-# When present it is §3.1, so a preset's cross-language section is supplied
-# pre-numbered through --metrics-json (`cross_lang_section`; §3.2 in that case,
-# §3.1 when this note is absent).
 DEFAULT_TIE_CONVENTION_SECTION = r"""### 3.1 关于 top-25 数字的口径（重要）
 
 **音频 top-25 命中率高度依赖并列（tie）的打破方式，报数必须注明口径。**
@@ -181,14 +115,8 @@ DEFAULT_TIE_CONVENTION_SECTION = r"""### 3.1 关于 top-25 数字的口径（重
 两个口径的方向一致；**幅度不可跨口径比较**（tie 主导时旧口径会把同等真实增益放大约 7 倍）。
 两个口径方向一致；幅度不可跨口径比较。"""
 
-# Fallback label of the single top-25 row for presets without a tie-robust
-# measurement (the number itself is the CUDA-topk gate figure).
 DEFAULT_TOP25_LABEL = "teacher-forced 40 步 / 1280 位置"
 
-# Fallback prose for such a preset in §6 (limitations) and §8 (English summary):
-# the tie-convention wording would otherwise render `n/a`, so it collapses to the
-# single-convention figure. The line breaks sit in the value because the wrap of
-# the surrounding paragraph depends on the sentence length.
 DEFAULT_QUALITY_TRADEOFF_SENTENCE = "音频 top-25 命中率 {top25}%，"
 DEFAULT_EN_SUMMARY_METRICS = (
     "\n**{top25}%**, text argmax {text_argmax}%, **{speed} steps/s**, "
@@ -203,25 +131,19 @@ STANDALONE_SCHEMA = {
     "loader_api": "moss_tts_lite.export.load_standalone_model(dir) -> (model, GptqMossTTS)",
 }
 
-
 def base_weight_key(li: int, name: str) -> str:
     """Original checkpoint key of backbone projection `name` in layer `li`."""
     if name not in _PROJ:
         raise KeyError(f"unknown projection {name!r} (expected one of {_LIN_NAMES})")
     return f"language_model.layers.{int(li)}.{_PROJ[name]}.weight"
 
-
-# ---------------------------------------------------------------------------
-# minimal safetensors writer (streaming; no `safetensors` dependency)
-# ---------------------------------------------------------------------------
 _ST_DTYPE: dict[torch.dtype, str] = {
     torch.float64: "F64", torch.float32: "F32", torch.float16: "F16",
     torch.bfloat16: "BF16", torch.int64: "I64", torch.int32: "I32",
     torch.int16: "I16", torch.int8: "I8", torch.uint8: "U8",
     torch.bool: "BOOL",
 }
-_WRITE_CHUNK = 1 << 26          # 64 MiB
-
+_WRITE_CHUNK = 1 << 26
 
 def _u8_view(t: torch.Tensor) -> np.ndarray:
     """Flat uint8 numpy view of a contiguous tensor (byte-exact payload)."""
@@ -229,18 +151,9 @@ def _u8_view(t: torch.Tensor) -> np.ndarray:
         t = t.contiguous()
     return t.view(torch.uint8).reshape(-1).numpy()
 
-
 def write_safetensors(path: str, entries, metadata: dict | None = None,
                       ) -> tuple[int, str]:
-    """Write `entries` (iterable of (name, tensor)) as one safetensors file.
-
-    Tensors are written tightly packed in the given order (safetensors forbids
-    gaps); the JSON header is padded with spaces to an 8-byte boundary as the
-    spec requires.  Returns ``(bytes_written, sha256_hex)``.
-
-    Implementation note: the file is streamed in 64 MiB chunks, so the peak
-    extra memory is one chunk no matter how large a tensor is.
-    """
+    """Write `entries` (iterable of (name, tensor)) as one safetensors file."""
     entries = [(n, t) for n, t in entries]
     header: dict = {}
     if metadata:
@@ -274,7 +187,6 @@ def write_safetensors(path: str, entries, metadata: dict | None = None,
         os.fsync(f.fileno())
     return total, h.hexdigest()
 
-
 def _sha256_file(path: str) -> tuple[int, str]:
     h = hashlib.sha256()
     size = 0
@@ -287,17 +199,12 @@ def _sha256_file(path: str) -> tuple[int, str]:
             h.update(b)
     return size, h.hexdigest()
 
-
-# ---------------------------------------------------------------------------
-# base-checkpoint provenance
-# ---------------------------------------------------------------------------
 def _hash_cache_path(repo_root: str) -> str:
     """Cache for base-checkpoint hashes (created on first use)."""
     return os.path.join(repo_root, ".cache", "base_hashes.json")
 
-
 def base_provenance(model_dir: str, hash_base: bool = True) -> dict:
-    """{repo_id, local_dir, files:[{name,bytes,sha256}], index_sha256, ...}"""
+    """{repo_id, local_dir, files:"""
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
     shards: list[str] = []
     if os.path.exists(index_path):
@@ -311,7 +218,7 @@ def base_provenance(model_dir: str, hash_base: bool = True) -> dict:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
         rel = os.path.relpath(os.path.abspath(model_dir), repo_root).replace(os.sep, "/")
-    except ValueError:                      # different drive (Windows)
+    except ValueError:
         rel = os.path.abspath(model_dir)
     prov = {"repo_id": DEFAULT_BASE_REPO, "local_dir": rel, "n_keys": n_keys,
         "shards": [{"name": s} for s in shards], "hashed": bool(hash_base)}
@@ -351,10 +258,6 @@ def base_provenance(model_dir: str, hash_base: bool = True) -> dict:
         prov["index_sha256"] = c["sha256"]
     return prov
 
-
-# ---------------------------------------------------------------------------
-# export
-# ---------------------------------------------------------------------------
 def _state_meta(gptq_state_path: str) -> dict:
     meta_path = gptq_state_path + ".meta.json"
     if not os.path.isfile(meta_path):
@@ -363,10 +266,8 @@ def _state_meta(gptq_state_path: str) -> dict:
             f"(per-linear group sizes / bf16 keeps); refusing to export.")
     return json.load(open(meta_path))
 
-
 def _tensor_order(model_dir: str, n_layers: int):
-    """Deterministic output order: base order preserved, quantized payloads
-    inserted next to the projection they replace."""
+    """Deterministic output order:"""
     yield ("language_model.embed_tokens.weight", None)
     yield ("language_model.norm.weight", None)
     for li in range(n_layers):
@@ -381,29 +282,13 @@ def _tensor_order(model_dir: str, n_layers: int):
     for i in range(33):
         yield (f"lm_heads.{i}.weight", None)
 
-
 def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
                       preset_name: str, *, metrics: dict | None = None,
                       hash_base: bool = True, template_path: str | None = None,
                       license_path: str | None = None, force: bool = False,
                       dry_run: bool = False, base_repo: str = DEFAULT_BASE_REPO,
                       quiet: bool = False) -> dict:
-    """Export a self-contained model directory.  Returns the meta.json dict.
-
-    Args:
-        model_dir: bf16 base checkpoint directory (source of the surviving
-            tensors; never modified).
-        gptq_state_path: offline GPTQ state (`w1.pt`/`w2.pt`) *plus* its
-            sibling `.meta.json` (group sizes + bf16 keeps).
-        out_dir: destination directory (created; must be empty unless force).
-        preset_name: tier label recorded in meta.json / the model card (e.g.
-            "w1"); the CLI maps it to `--quant w4gptq` usage instructions.
-        metrics: measured metrics to embed (default: PRESET_METRICS[preset]).
-        hash_base: sha256 the base shards for provenance (~16.6 GiB read, cached
-            in the upstream workspace).
-        template_path: model-card template (default `moss_tts_lite/README_hf.md`).
-        dry_run: build the tensor inventory + meta but write nothing.
-    """
+    """Export a self-contained model directory."""
     def log(msg: str) -> None:
         if not quiet:
             print(f"[export] {msg}", flush=True)
@@ -453,7 +338,6 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
     log(f"state: {n_layers} layers, {len(quantized)} quantized projections, "
         f"{len(keep_keys)} bf16 keeps (groups {mode_counts})")
 
-    # ---- surviving bf16 tensors, read via mmap (no full-base load) --------
     want = [name for name, _ in _tensor_order(model_dir, n_layers)
             if name not in quantized]
     log(f"reading {len(want)} bf16 tensors from {model_dir} (mmap) …")
@@ -476,12 +360,6 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
         entries.append((name, t))
         shapes[name] = list(t.shape)
 
-    # ---- model config / layer-0 shapes -----------------------------------
-    # The loader only needs *shapes*: `MossTTSModel.__init__` derives
-    # n_heads/n_kv_heads from layer-0 q/k_proj.  Both are quantized here, so
-    # take the shape from the packed record ([K//g, N, 2] -> [N, K]) and
-    # cross-check it against the base shard (cheap: the reader only maps the
-    # tensors, it does not read their pages).
     def _shape_from_record(li: int, name: str) -> list[int]:
         rec = records[f"layers.{li}.{name}.qsz"]
         g = int(gmap.get((li, name), group_default))
@@ -567,15 +445,12 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
         log("dry-run: nothing written")
         return meta
 
-    # ---- write -----------------------------------------------------------
     os.makedirs(out_dir, exist_ok=True)
     qpath = os.path.join(out_dir, Q_FILE)
     if os.path.exists(qpath) and not force:
         raise FileExistsError(f"{qpath} exists (use force=True to overwrite)")
     tmp = qpath + ".part"
-    # NOTE: no volatile fields in the tensor file's __metadata__ — together with
-    # the deterministic tensor order this makes the export byte-reproducible
-    # (the timestamp lives in meta.json, which is *not* part of the payload).
+
     size, digest = write_safetensors(
         tmp, entries, metadata={"format": FORMAT_TAG, "preset": preset_name})
     os.replace(tmp, qpath)
@@ -585,7 +460,6 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
         f.write(f"{digest}  {Q_FILE}\n")
     log(f"wrote {Q_FILE}: {size / 2**30:.2f} GiB sha256 {digest[:16]}…")
 
-    # ---- small files -----------------------------------------------------
     copied = []
     for name in SMALL_FILES:
         src = os.path.join(model_dir, name)
@@ -607,7 +481,6 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
                             "sha256": _sha256_file(os.path.join(out_dir, name))[1]}
                      for name in sorted(copied)}
 
-    # ---- model card ------------------------------------------------------
     tpl = template_path or os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "README_hf.md")
@@ -624,7 +497,6 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
     with open(os.path.join(out_dir, META_FILE), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
 
-    # ---- self-check (read the file back with the runtime reader) ---------
     hdr = safetensors_header(qpath)
     got = len([k for k in hdr if k != "__metadata__"])
     if got != len(entries):
@@ -637,12 +509,8 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
     log(f"done in {time.time() - t_start:.1f}s -> {out_dir}")
     return meta
 
-
-# ---------------------------------------------------------------------------
-# model card rendering
-# ---------------------------------------------------------------------------
 def _fmt_metric(val, fmt: str) -> str:
-    """Format an optional metric; missing metrics render as `n/a` (never NaN)."""
+    """Format an optional metric;"""
     if val is None:
         return "n/a"
     try:
@@ -650,20 +518,13 @@ def _fmt_metric(val, fmt: str) -> str:
     except (TypeError, ValueError):
         return "n/a"
 
-
 def _as_section(text, lead: str = "\n") -> str:
-    """Normalize a conditional section to ``lead + block`` ("" when absent).
-
-    The separator is *leading* so several sections can share one template line:
-    an absent section collapses to nothing instead of leaving a gap, and the
-    caller widens the separator of a section that follows a present one.
-    """
+    """Normalize a conditional section to ``lead + block`` ("" when absent)."""
     body = str(text or "").strip("\n")
     return lead + body if body else ""
 
-
 def render_model_card(template: str, meta: dict, preset_name: str) -> str:
-    """Substitute {{PLACEHOLDER}}s; unknown placeholders are a hard error."""
+    """Substitute {{PLACEHOLDER}}s;"""
     preset = meta["presets"][preset_name]
     m = preset.get("metrics") or {}
     q = meta["quantization"]
@@ -674,15 +535,7 @@ def render_model_card(template: str, meta: dict, preset_name: str) -> str:
         f"`{s.get('sha256', 'not hashed')[:16]}…` |" for s in shards)
     keeps = (f"{len(preset['bf16_linears'])} projections kept bf16"
              + (f" — {m.get('bf16_keeps')}" if m.get("bf16_keeps") else ""))
-    # ---- tie-convention reporting -------------------------------------------
-    # The top-25 number is tie-convention dependent: a preset that HAS a
-    # tie-robust measurement reports it as the primary figure alongside the
-    # historical CUDA-topk number, the per-stratum gains and mean |Δlogit|.
-    # A preset without one (e.g. w1) must never render `n/a` rows, so the same
-    # block collapses to the single historical gate row. The prose overrides
-    # (`bf16_keep_text`, ...) and the per-preset sections are supplied through
-    # --metrics-json; the flat single-value placeholders are kept for custom
-    # templates that use the older form.
+
     has_tie = "tie_robust_cover_pct" in m
     top25 = f"{float(m.get('gate2_audio_top25_pct', float('nan'))):.2f}"
     if has_tie:
@@ -703,9 +556,7 @@ def render_model_card(template: str, meta: dict, preset_name: str) -> str:
         tie_rows = f"| 音频 top-25 命中率（{label}） | **{top25}%** | 100% |"
         tie_note = ""
     tie_section = _as_section(tie_note)
-    # The §6 (limitations) and §8 (English summary) prose that quotes the top-25
-    # figure: with a tie-robust measurement it names both conventions, otherwise
-    # it collapses to the single-convention figure (never `n/a`).
+
     common = dict(top25=top25,
                   text_argmax=_fmt_metric(m.get("gate2_text_argmax_pct"), ".1f"),
                   speed=_fmt_metric(m.get("steps_per_s_steady"), ".1f"),
@@ -729,8 +580,7 @@ def render_model_card(template: str, meta: dict, preset_name: str) -> str:
                               DEFAULT_QUALITY_TRADEOFF_SENTENCE)).format(**common)
         en_metrics = str(m.get("en_summary_metrics",
                                DEFAULT_EN_SUMMARY_METRICS)).format(**common)
-    # The cross-language section follows the tie note (when present), so its
-    # leading separator widens to keep exactly one blank line between them.
+
     cross_section = _as_section(m.get("cross_lang_section",
                                       DEFAULT_CROSS_LANG_SECTION),
                                 "\n\n" if tie_note else "\n")
@@ -753,9 +603,7 @@ def render_model_card(template: str, meta: dict, preset_name: str) -> str:
         "RUNAWAY": str(m.get("runaway", "n/a")),
         "BASE_REPO": meta.get("base_repo", DEFAULT_BASE_REPO),
         "BASE_DIR": base.get("local_dir", "models/MOSS-TTS-v1.5"),
-        # the offline GPTQ state this directory was exported from: recorded in
-        # meta.json (`state.source_file`), and its sha256 either under
-        # `state.sha256` or in the metrics' `build` block (w1p records it there)
+
         "STATE_FILE": str(meta.get("state", {}).get("source_file", "n/a")),
         "STATE_SHA256": str(
             meta.get("state", {}).get("sha256")
@@ -788,12 +636,8 @@ def render_model_card(template: str, meta: dict, preset_name: str) -> str:
                          f"{sorted(set(leftover))}")
     return out
 
-
-# ---------------------------------------------------------------------------
-# reader / runtime loader
-# ---------------------------------------------------------------------------
 def is_standalone_dir(path: str) -> bool:
-    """True if `path` is a standalone export (meta.json with our format tag)."""
+    """True if `path` is a standalone export (meta."""
     p = os.path.join(path, META_FILE)
     if not os.path.isfile(p):
         return False
@@ -804,9 +648,8 @@ def is_standalone_dir(path: str) -> bool:
         return False
     return meta.get("format") == FORMAT_TAG
 
-
 def standalone_presets(path: str) -> list[str]:
-    """Preset names offered by a standalone directory (e.g. ["w1"])."""
+    """Preset names offered by a standalone directory (e."""
     with open(os.path.join(path, META_FILE), encoding="utf-8") as f:
         meta = json.load(f)
     names = list(meta.get("presets") or {})
@@ -814,32 +657,14 @@ def standalone_presets(path: str) -> list[str]:
         names = [meta["preset_name"]]
     return names
 
-
 class _PlaceholderWeights(dict):
-    """Weights dict that fakes the projections replaced by int4 payloads.
-
-    `MossTTSModel.__init__` reads *every* backbone projection through `T()`
-    (a `.to(device,dtype).contiguous()` copy) and additionally inspects
-    `.shape[0]` of layer-0 q/k_proj to derive `n_heads`/`n_kv_heads`.  In a
-    standalone export those bf16 tensors do not exist any more, so:
-
-      * layer-0 q/k_proj are handed out as correctly *shaped* zero tensors on
-        the target device (~40 MiB, freed as soon as `GptqMossTTS._quantize`
-        pops them);
-      * every other quantized key gets one shared 0-element tensor — it is
-        only ever passed to `.to()/.contiguous()` and popped before the first
-        forward pass, and materializing the real shapes would allocate the
-        13.9 GiB of bf16 the quantization removed in the first place.
-
-    The int4 payloads themselves are installed by `GptqMossTTS._quantize`
-    from the state dict, exactly like the `base + w1.pt` path.
-    """
+    """Weights dict that fakes the projections replaced by int4 payloads."""
 
     _SENTINEL = object()
 
     def __init__(self, real: dict, placeholders: dict[str, tuple | None],
                  device, dtype: torch.dtype):
-        """placeholders: {key: shape-for-shape-probes | None (= 0-element)}."""
+        """placeholders:"""
         super().__init__(real)
         self._ph = dict(placeholders)
         self._device = device
@@ -860,19 +685,12 @@ class _PlaceholderWeights(dict):
                     self._empty = torch.zeros(0, dtype=self._dtype,
                                               device=self._device)
                 val = self._empty
-            dict.__setitem__(self, key, val)       # cache (popped by _quantize)
+            dict.__setitem__(self, key, val)
         return val
-
 
 def read_standalone(model_dir: str, expected_preset: str | None = None,
                     ) -> tuple[dict, dict, dict, dict, list]:
-    """Read a standalone directory *without* touching the base checkpoint.
-
-    Returns ``(meta, weights, state, group_size_map, bf16_keep)`` where
-    ``weights`` holds the surviving bf16 tensors under their original
-    checkpoint key names (mmap views) and ``state`` is the
-    ``{layer: {proj: {"packed", "qsz"}}}`` dict `GptqMossTTS` consumes.
-    """
+    """Read a standalone directory *without* touching the base checkpoint."""
     meta_path = os.path.join(model_dir, META_FILE)
     with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
@@ -890,7 +708,7 @@ def read_standalone(model_dir: str, expected_preset: str | None = None,
         raise FileNotFoundError(f"{qfile} not found in {model_dir}")
     raw = read_safetensors(qfile)
     weights: dict[str, torch.Tensor] = {}
-    # flattened export key  ->  record key expected by GptqMossTTS._quantize
+
     _RK = {"q": "packed", "qsz": "qsz"}
     state: dict[int, dict[str, dict[str, torch.Tensor]]] = {}
     for key, t in raw.items():
@@ -915,32 +733,25 @@ def read_standalone(model_dir: str, expected_preset: str | None = None,
     keep += [int(x) for x in (pmeta.get("bf16_layers") or [])]
     return meta, weights, state, gmap, keep
 
-
 def load_standalone_model(model_dir: str, device="cuda",
                           dtype: torch.dtype = torch.bfloat16,
                           max_seq_len: int = 8192,
                           expected_preset: str | None = None):
-    """Assemble `(MossTTSModel, GptqMossTTS)` straight from a standalone dir.
-
-    Equivalent to the `base + <state>.pt` path (`MossTTSModel(base)` +
-    `load_gptq_fast(model, state)`) down to the last bit; see
-    the upstream workspace.
-    """
+    """Assemble `(MossTTSModel, GptqMossTTS)` straight from a standalone dir."""
     dev = torch.device(device)
     meta, weights, state, gmap, keep = read_standalone(model_dir, expected_preset)
     q = meta.get("quantization", {})
     if q.get("method") != "gptq":
         raise ValueError(f"{model_dir}: unsupported quantization "
                          f"{q.get('method')!r} (only 'gptq')")
-    # only layer-0 q/k_proj are inspected for their shape (n_heads/n_kv_heads);
-    # everything else is popped by GptqMossTTS._quantize before any forward pass
+
     cfg = meta["model_config"]
     placeholders: dict[str, tuple | None] = {}
     for li, projs in state.items():
         for proj in projs:
             key = base_weight_key(li, proj)
             if (li, proj) in keep or key in weights:
-                continue                    # kept in bf16 -> real tensor present
+                continue
             if li == 0 and proj in ("q", "k"):
                 placeholders[key] = tuple(cfg["layer0_q_proj_shape"] if proj == "q"
                                           else cfg["layer0_k_proj_shape"])
@@ -954,13 +765,9 @@ def load_standalone_model(model_dir: str, device="cuda",
                            (meta.get("presets") or {}).get(
                                meta.get("preset_name"), {}).get(
                                "group_size_default", 128)))
-    del weights, state                  # drop the mmap views
+    del weights, state
     return model, fast
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m moss_tts_lite.export",
@@ -991,7 +798,6 @@ def main(argv=None) -> int:
                           ("preset_name", "n_tensors", "quantized_bytes",
                            "model_config")}, indent=1))
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

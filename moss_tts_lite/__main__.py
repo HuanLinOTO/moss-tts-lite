@@ -1,4 +1,4 @@
-"""``python -m moss_tts_lite "text" -o out.wav`` entry point."""
+"""``python -m moss_tts_lite "text" -o out."""
 
 import sys
 

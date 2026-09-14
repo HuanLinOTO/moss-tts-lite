@@ -1,11 +1,4 @@
-"""CLI: text -> TTS -> codec -> 24 kHz wav.
-
-Pipeline: build_tts_prompt -> MossTTSModel -> generate ->
-delayed_rows_to_segments -> MossCodecDecoder.decode -> soundfile.write.
-Decode path: fast (default, bitwise) / --fast-native (faster, not bitwise) /
---eager (reference). Precedence: CLI > moss_tts_lite/config.yaml > built-ins.
-VRAM: codec+TTS co-resident by default; on CUDA OOM, sequential retry.
-"""
+"""CLI:"""
 
 from __future__ import annotations
 
@@ -34,8 +27,6 @@ MODEL_DIR = os.environ.get("MOSS_TTS_MODEL_DIR") or os.path.join(
 CODEC_DIR = os.environ.get("MOSS_TTS_CODEC_DIR") or os.path.join(
     os.path.dirname(__file__), "..", "models", "MOSS-Audio-Tokenizer")
 
-# Resolution: --gptq-state > $MOSS_TTS_GPTQ_DIR > <model_dir>/gptq/
-# (offline artifacts, not shipped; standalone exports on HF/ModelScope).
 GPTQ_PRESETS = {"w1": "w1.pt", "w1p": "w1p.pt", "w2": "w2.pt"}
 GPTQ_DEFAULT_PRESET = "w1p"
 GPTQ_REGEN_HINT = (
@@ -44,11 +35,8 @@ GPTQ_REGEN_HINT = (
 
 SR = 24000
 
-#: The delay-ramp flush needs positions beyond max_new_tokens; 64 covers the
-#: worst case (normal end: 34 ramp-out rows).
 KV_RAMP_MARGIN = 64
 
-#: Library default; the CLI overrides it with the on-demand size below.
 DEFAULT_MAX_SEQ_LEN = 8192
 
 _BUILTIN_DEFAULTS = {
@@ -67,49 +55,30 @@ _BUILTIN_DEFAULTS = {
     "audio_top_p": 0.8,
     "audio_top_k": 25,
     "audio_repetition_penalty": 1.0,
-    "fast": True,  # default; --eager selects the slow path
+    "fast": True,
     "fast_native": False,
     "watchdog": True,
     "watchdog_silence_frames": None,
     "watchdog_max_segment_frames": None,
 }
 
-# [pause Ns] markers are requested silence, not runaway: excluded below.
 _PAUSE_RE = re.compile(r"\[pause\s*(\d+(?:\.\d+)?)s\]", re.IGNORECASE)
-
 
 def _max_pause_s(text: str) -> float | None:
     vals = [float(m) for m in _PAUSE_RE.findall(text or "")]
     return max(vals) if vals else None
 
-
 def _kv_mib(n_seq: int) -> float:
-    """KV bytes for `n_seq` positions: layers * 2 (K,V) * kv_heads * head_dim * bf16."""
+    """KV bytes for `n_seq` positions:"""
     return n_seq * 36 * 2 * 8 * 128 * 2 / 2**20
 
-
 def _resolve_max_seq_len(requested: int | None, l0: int, max_new_tokens: int) -> int:
-    """KV positions to allocate: on-demand when `requested` is None.
-
-    On-demand means exactly what this single call needs:
-    ``L0 + max_new_tokens + KV_RAMP_MARGIN`` (see KV_RAMP_MARGIN).  An explicit
-    `requested` is a **lower bound**: the allocation is never smaller than the
-    on-demand size, so a user asking for a huge cache gets it, and a user asking
-    for a smaller one still gets a working run instead of a "prompt exceeds KV
-    cache" error.  The CLI does not expose a way to undersize the cache on
-    purpose (that is what --max-new-tokens is for).
-    """
+    """KV positions to allocate:"""
     need = max(1, int(l0)) + max(0, int(max_new_tokens)) + KV_RAMP_MARGIN
     return max(need, int(requested)) if requested else need
 
-
 def _kv_advice(exc: ValueError, l0: int, max_new_tokens: int) -> ValueError:
-    """Re-raise a KV-cache ValueError with an actionable suggestion appended.
-
-    The generation loops raise a bare "prompt L + max_new_tokens N exceeds KV
-    cache S"; on an 8 GB card that is the one error a user can actually fix, so
-    the message names both remedies (and says which one this code path uses).
-    """
+    """Re-raise a KV-cache ValueError with an actionable suggestion appended."""
     msg = str(exc)
     if "KV cache" not in msg and "exceeds" not in msg:
         return exc
@@ -123,21 +92,13 @@ def _kv_advice(exc: ValueError, l0: int, max_new_tokens: int) -> ValueError:
         f"  Raising --max-seq-len does not help by itself -- it is a lower bound, "
         f"and the on-demand size already follows --max-new-tokens.")
 
-
 def _graph_kwargs(max_graphs: int | None) -> dict:
-    """FastNativeTTS kwargs; `None` keeps the class default (256)."""
+    """FastNativeTTS kwargs;"""
     return {} if max_graphs is None else {"max_graphs": int(max_graphs)}
-
 
 def _oom_advice(exc: torch.cuda.OutOfMemoryError, text: str,
                 max_new_tokens: int) -> torch.cuda.OutOfMemoryError:
-    """Wrap a terminal OOM with the two remedies that actually work here.
-
-    A terminal OOM (both the resident and the sequential strategy failed) on a
-    small card is almost always a generation budget too large for the card, not
-    a broken configuration: the decode peak is weights + graph pool + KV, and of
-    those only the KV half scales with the user's request.  Say so.
-    """
+    """Wrap a terminal OOM with the two remedies that actually work here."""
     return torch.cuda.OutOfMemoryError(
         f"{exc}\n[moss_tts_lite] both VRAM strategies failed (text {len(text)} chars, "
         f"--max-new-tokens {max_new_tokens}).\n"
@@ -149,22 +110,20 @@ def _oom_advice(exc: torch.cuda.OutOfMemoryError, text: str,
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 
-
 def _yaml_defaults(path: str | None) -> dict:
-    """Load optional YAML overrides; never fail the CLI because of them."""
+    """Load optional YAML overrides;"""
     if not path or not os.path.exists(path):
         return {}
     try:
         import yaml
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-    except Exception as exc:  # noqa: BLE001 - config is strictly optional
+    except Exception as exc:    # noqa: BLE001 - config is strictly optional
         print(f"[moss_tts_lite] ignoring config {path}: {exc}", file=sys.stderr)
         return {}
     if not isinstance(data, dict):
         return {}
     return {k: v for k, v in data.items() if k in _BUILTIN_DEFAULTS}
-
 
 def _load_tts(model_dir: str, dev: torch.device, max_seq_len: int = 8192) -> MossTTSModel:
     weights = read_safetensors(model_dir)
@@ -174,15 +133,13 @@ def _load_tts(model_dir: str, dev: torch.device, max_seq_len: int = 8192) -> Mos
     torch.cuda.empty_cache()
     return model
 
-
 def _load_tts_standalone(model_dir: str, dev: torch.device,
                          max_seq_len: int = 8192):
-    """Assemble a self-contained quantized export (meta.json; no base ckpt)."""
+    """Assemble a self-contained quantized export (meta."""
     model, fast = load_standalone_model(model_dir, device=dev,
                                         max_seq_len=max_seq_len)
     torch.cuda.empty_cache()
     return model, fast
-
 
 def _standalone_tokenizer(model_dir: str):
     """Tokenizer taken from the export dir itself (QwenBPE on its own files)."""
@@ -192,16 +149,9 @@ def _standalone_tokenizer(model_dir: str):
                    tok_json if os.path.exists(tok_json)
                    else os.path.join(model_dir, "added_tokens.json"))
 
-
 def _resolve_gptq_state(spec: str, gptq_state: str | None,
                         model_dir: str) -> str:
-    """Resolve a `--quant w4gptq[...]` request to a state file path.
-
-    Order: ``--gptq-state`` > ``$MOSS_TTS_GPTQ_DIR`` > ``<model_dir>/gptq/``.
-    ``spec`` is a preset name ("w1"/"w2") or a literal path.  Never falls back
-    silently to another quantization: a missing state is a hard error (the
-    error text carries the regeneration commands).
-    """
+    """Resolve a `--quant w4gptq[."""
     fname = GPTQ_PRESETS.get(spec, spec if spec.endswith(".pt") else f"{spec}.pt")
     if gptq_state:
         cands = [gptq_state]
@@ -230,36 +180,13 @@ def _resolve_gptq_state(spec: str, gptq_state: str | None,
           "<model_dir>/gptq/, or pass\n--quant w4gptq:auto to fall back to the "
           "non-GPTQ w4 tier.\n" + GPTQ_REGEN_HINT)
 
-
 def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
               device, model_dir, codec_dir, chunk_duration, sampling, resident,
               fast=True, quant=None, w4_group_size=None, watchdog=True,
               watchdog_silence_frames=None, watchdog_max_segment_frames=None,
               max_requested_pause_s=None, gptq_state=None, fast_native=False,
               max_seq_len=None, max_graphs=None):
-    """One full pass; returns (wav float32 np, sampling rate, GenResult, stats).
-
-    resident=True  : codec loaded first and kept co-resident during TTS.
-    resident=False : TTS -> generate -> free -> codec -> decode.
-    fast=True      : CUDA-graph decode path (moss_tts_lite.fast); numerics of the
-                     exact path are preserved (M1: bitwise-identical decode).
-                     This is the DEFAULT for the CLI; fast=False is the eager
-                     reference (MossTTSModel.step, `--eager`).
-    fast_native=True: whole-step CUDA graph tier (moss_tts_lite.fast_native,
-                     arm n2).  NOT bitwise: it swaps kernels (`F.rms_norm`, fused
-                     int4 GEMMs, fused heads) to cut the step's kernel count, so
-                     it decodes a different-but-valid utterance at ~97 steps/s
-                     on W4 (~81 for fast.py); measured on A10G.
-                     Incompatible with --greedy (the native loop samples).
-    max_seq_len    : KV cache positions.  ``None`` (the CLI default) sizes it on
-                     demand: the prompt is built first, L0 is known before the
-                     weights are loaded, and the cache is exactly
-                     ``L0 + max_new_tokens + KV_RAMP_MARGIN``.  An explicit
-                     integer is a *lower bound* (a small request is still rounded
-                     up to the on-demand size, which the run actually needs).
-    max_graphs     : fast_native's whole-step-graph pool cap (see FastNativeTTS).
-    Either way every large object is released in ``finally``.
-    """
+    """One full pass;"""
     dev = torch.device(device)
     model = None
     fast_model = None
@@ -270,7 +197,7 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
             codec = MossCodecDecoder(codec_dir, device=dev)
         standalone = is_standalone_dir(model_dir)
         tokenizer = _standalone_tokenizer(model_dir) if standalone else None
-        # prompt first: L0 fixes the on-demand KV size
+
         prompt = build_tts_prompt(text, language=language, tokenizer=tokenizer)
         want_seq = _resolve_max_seq_len(max_seq_len, int(prompt["input_ids"].shape[1]),
                                         max_new_tokens)
@@ -290,14 +217,14 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
         stats: dict = {}
         if fast:
             if standalone:
-                pass          # quantized weights already installed by the loader
+                pass
             elif gptq_state:
                 fast_model = load_gptq_fast(model, gptq_state)
             else:
                 _fkw = {} if w4_group_size is None else {"w4_group_size": w4_group_size}
                 fast_model = FastMossTTS(model, quant=quant, **_fkw)
             if fast_native:
-                # built once: per-length graphs must survive across calls
+
                 native = FastNativeTTS(fast_model, arm="n2",
                                        **_graph_kwargs(max_graphs))
             try:
@@ -357,7 +284,6 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
             del codec
         torch.cuda.empty_cache()
 
-
 def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False,
                max_new_tokens=4096, device="cuda", model_dir=MODEL_DIR,
                codec_dir=CODEC_DIR, chunk_duration=8.0,
@@ -366,20 +292,7 @@ def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False
                watchdog_silence_frames=None, watchdog_max_segment_frames=None,
                gptq_state=None, fast_native=False, max_seq_len=None,
                max_graphs=None):
-    """End-to-end text -> wav.  Returns (wav, sr, res, strategy).
-
-    Tries the co-resident strategy (codec + TTS on one card) first and falls
-    back to sequential (TTS freed before the codec loads) on CUDA OOM.
-
-    `fast=True` (the default, matching the CLI) selects the CUDA-graph path;
-    `fast=False` is the eager reference.  This mirrors the CLI's behaviour flip
-    (v1.1.0): a caller that wants the old eager default must now say so, and
-    `test_parity`/library callers that exercise `MossTTSModel.step` directly are
-    unaffected either way.
-
-    `max_seq_len=None` (the CLI default) sizes the KV cache on demand; see
-    `_resolve_max_seq_len`.  `max_graphs=None` keeps FastNativeTTS's own default.
-    """
+    """End-to-end text -> wav."""
     sampling = {k: v for k, v in sampling.items() if v is not None} if sampling else {}
     max_pause = _max_pause_s(text)
     strategy = "resident"
@@ -407,7 +320,6 @@ def synthesize(text: str, output: str, *, language=None, seed=1234, greedy=False
     if stats is not None:
         stats.update(tstats)
     return wav, SR, res, strategy
-
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
@@ -477,7 +389,7 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     cfg = {**_BUILTIN_DEFAULTS, **_yaml_defaults(args.config)}
-    # CLI flags (non-None) win over YAML
+
     if args.language is not None:
         cfg["language"] = args.language
     if args.seed is not None:
@@ -496,12 +408,12 @@ def main(argv=None) -> int:
         cfg["fast"] = False
         cfg["fast_native"] = False
         if args.fast:
-            # contradiction: refuse instead of silent last-wins
+
             print("[moss_tts_lite] --eager wins over --fast (--fast is a no-op "
                   "alias anyway); running the eager reference path",
                   file=sys.stderr)
     if args.fast:
-        # no-op alias (fast is the default), kept for compatibility
+
         if not args.eager:
             print("[--fast is now the default; this flag is a no-op]",
                   file=sys.stderr)
@@ -523,10 +435,10 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             cfg["fast"] = False
     if args.fast_native and cfg["greedy"]:
-        # the native tier samples; no argmax path exists
+
         raise SystemExit("[moss_tts_lite] --fast-native cannot be combined with "
                          "--greedy (the native tier samples)")
-    # standalone dirs are self-describing (meta.json); no separate state file
+
     standalone_preset = None
     if args.model_dir and is_standalone_dir(args.model_dir):
         standalone_preset = standalone_presets(args.model_dir)[0]
@@ -549,7 +461,7 @@ def main(argv=None) -> int:
                     f"or point --model-dir at the {want!r} export")
         print(f"[moss_tts_lite] standalone quantized export detected: using its "
               f"built-in preset {standalone_preset!r}")
-    # --quant needs the fast path; --eager cannot carry it
+
     if args.quant is not None and args.eager:
         raise SystemExit("[moss_tts_lite] --quant cannot be combined with --eager: "
                          "weight quantization is only implemented on the fast "
@@ -565,7 +477,7 @@ def main(argv=None) -> int:
             quant, w4_group = "w4", 32
         elif args.quant == "w8":
             quant, w4_group = "w8", None
-        else:                                   # w4gptq / w4gptq:w2 / *:auto
+        else:
             preset = (args.quant.split(":", 1)[1] if ":" in args.quant
                       else GPTQ_DEFAULT_PRESET)
             want_auto = preset == "auto"

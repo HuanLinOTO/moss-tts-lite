@@ -1,9 +1,4 @@
-"""Operator-for-operator port of models/MOSS-TTS-v1.5/inference_utils.py
-sample_token (top_k -> top_p -> softmax -> multinomial, repetition penalty first).
-
-batch=1 simplifications are allowed only where mathematically identical:
-the reference's python loop over batch items becomes direct indexing.
-"""
+"""Operator-for-operator port of models/MOSS-TTS-v1."""
 
 from typing import Optional
 
@@ -12,7 +7,7 @@ import torch.nn.functional as F
 
 
 def apply_top_k(logits: torch.Tensor, top_k: int) -> torch.Tensor:
-    """inference_utils.apply_top_k: keep the k largest logits, -inf elsewhere."""
+    """inference_utils."""
     batch_size, vocab_size = logits.shape
     top_k = min(top_k, vocab_size)
     top_k_values, top_k_indices = torch.topk(logits, top_k, dim=-1)
@@ -23,8 +18,7 @@ def apply_top_k(logits: torch.Tensor, top_k: int) -> torch.Tensor:
 
 
 def apply_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-    """inference_utils.apply_top_p (the loop version the reference sample_token
-    actually calls; mathematically identical to apply_top_p_optimized)."""
+    """inference_utils."""
     probs = F.softmax(logits, dim=-1)
     sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
@@ -44,10 +38,7 @@ def apply_repetition_penalty_delay_pattern(
     prev_tokens: torch.LongTensor,
     penalty: float,
 ) -> torch.Tensor:
-    """inference_utils.apply_repetition_penalty_delay_pattern.
-
-    logits [B, H, V] (audio, per-head penalty over prev_tokens[..., h]) or
-    [N, V] (text; prev_tokens flattened to a global unique set)."""
+    """inference_utils."""
     if penalty == 1.0 or prev_tokens is None:
         return logits
 
@@ -84,9 +75,7 @@ def sample_token(
     top_k=None,
     do_sample=True,
 ) -> torch.Tensor:
-    """inference_utils.sample_token, verbatim order:
-    repetition penalty -> argmax / flatten -> top_k -> top_p -> softmax -> multinomial.
-    """
+    """inference_utils."""
     vocab_size = logits.size(-1)
 
     if prev_tokens is not None and repetition_penalty != 1.0:
@@ -110,7 +99,7 @@ def sample_token(
 
 
 def apply_top_p_optimized(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-    """inference_utils.apply_top_p_optimized (scatter variant)."""
+    """inference_utils."""
     probs = F.softmax(logits, dim=-1)
     sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
@@ -125,7 +114,7 @@ def apply_top_p_optimized(logits: torch.Tensor, top_p: float) -> torch.Tensor:
 
 
 def find_last_equal_C(tensor: torch.Tensor, C: int) -> torch.Tensor:
-    """inference_utils.find_last_equal_C: last index where tensor == C (-1 if none)."""
+    """inference_utils."""
     mask = (tensor == C).int()
     flipped_mask = mask.flip(dims=[1])
     flipped_indices = flipped_mask.argmax(dim=1)

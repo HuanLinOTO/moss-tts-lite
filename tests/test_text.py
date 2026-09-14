@@ -1,27 +1,10 @@
-"""Text-layer tests: BPE, normalizer, prompt building.
-
-Unit tests on synthetic inputs, plus parity gates against the
-reference implementations shipped with MOSS-TTS-v1.5: the HF
-``tokenizers`` fast tokenizer (via .tmp/venv-hf) and the reference
-``MossTTSDelayProcessor``.  CPU only.
-
-Consolidated from:
-  test_bpe.py
-  test_normalizer.py
-  test_prompt.py
-  test_prompt_continuation.py
-
-Run:
-  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_text.py
-"""
+"""Text-layer tests:"""
 
 from __future__ import annotations
 
 import os
 import sys
 
-# `python3 tests/<this file>.py` straight from the repo root must import
-# moss_tts_lite without an explicit PYTHONPATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import importlib.util
@@ -40,11 +23,6 @@ from moss_tts_lite.prompt import (AUDIO_PAD_CODE, N_VQ, _apply_chat_template_use
                                   build_continuation_prompt, build_tts_prompt,
                                   default_tokenizer)
 
-# --------------------------------------------------------------------------- #
-# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
-# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
-# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
-# --------------------------------------------------------------------------- #
 ROOT = os.environ.get("MOSS_TTS_ROOT",
                       os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
@@ -53,19 +31,8 @@ REF_SCRIPT = os.path.join(ROOT, "models", "MOSS-TTS-v1.5",
                           "tts_robust_normalizer_single_script.py")
 GOLDEN_PATH = os.path.join(ROOT, ".tmp", "golden2", "cont_prompt_golden.pt")
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_bpe.py ----
-# ------------------------------------------------------------------------- #
-
-
-
-# --------------------------------------------------------------------------- #
-# tiny synthetic BPE for controlled unit tests
-# --------------------------------------------------------------------------- #
-
 def _write_tiny_bpe(td: str):
-    # byte-level vocab: 256 byte chars + merged symbols
+
     def bytes_to_unicode():
         bs = (list(range(ord("!"), ord("~") + 1))
               + list(range(ord("\xa1"), ord("\xac") + 1))
@@ -100,10 +67,8 @@ def _write_tiny_bpe(td: str):
         json.dump({"<|special|>": 300, "<|endoftext|>": 301, "<tool_call>": 302}, f)
     return vp, mp, ap, b2u
 
-
 def _enc_raw(bpe: QwenBPE, b2u: dict[int, str], text: str) -> list[int]:
-    """Encode pretending every char is its own token (no merges applied):
-    used only to sanity-check decode() byte mapping."""
+    """Encode pretending every char is its own token (no merges applied):"""
     ids = []
     for piece in bpe._pretokenize(text):
         word = "".join(b2u[c] for c in piece.encode("utf-8"))
@@ -111,37 +76,32 @@ def _enc_raw(bpe: QwenBPE, b2u: dict[int, str], text: str) -> list[int]:
             ids.append(bpe._vocab[ch])
     return ids
 
-
 def test_tiny_bpe_merges():
     with tempfile.TemporaryDirectory() as td:
         vp, mp, ap, b2u = _write_tiny_bpe(td)
         bpe = QwenBPE(vp, mp, ap)
-        # "hello": h+e -> he(256); th+e... "hello" pretokenizes to ["hello"]
-        # byte chars: h e l l o -> merges rank: (h,e)=0 first -> he l l o
-        # then (l,o)=3 -> he l lo ; no (he,l)... => ["he","l","lo"]
+
         ids = bpe.encode("hello")
         toks = [bpe.decode([i]) for i in ids]
         assert "".join(toks) == "hello"
         assert bpe.decode(ids) == "hello"
-        # added tokens split raw text (even glued to words) and are single ids
+
         ids = bpe.encode("hi<|special|>there<tool_call>x<|special|>")
         assert ids.count(300) == 2 and ids.count(302) == 1
         assert bpe.decode(ids) == "hi<|special|>there<tool_call>x<|special|>"
-        # cache: second call returns identical ids
+
         assert bpe.encode("hello") == ids[:0] + bpe.encode("hello")
-        # longest added token wins: encode text starting with both prefixes
+
         ids2 = bpe.encode("<|special|>")
         assert ids2 == [300]
-        # unknown byte path still decodes with replacement (latin-1 chars exist
-        # in the byte alphabet, so use a real multi-byte char)
+
         ids3 = bpe.encode("中")
         assert bpe.decode(ids3) == "中"
-        # pre-tokenizer: digits split singly, contractions, whitespace runs
+
         assert bpe._pretokenize("abc123") == ["abc", "1", "2", "3"]
         assert bpe._pretokenize("I'm fine") == ["I", "'m", " fine"]
         assert bpe._pretokenize("don't") == ["don", "'t"]
         print("  tiny-BPE merges/added-tokens/cache/pretokenizer: OK")
-
 
 def test_roundtrip_samples():
     if not os.path.isdir(MODEL_DIR):
@@ -171,11 +131,6 @@ def test_roundtrip_samples():
         ids = bpe.encode(s)
         assert bpe.decode(ids) == s, f"round-trip failed: {s!r} -> {bpe.decode(ids)!r}"
     print(f"  round-trip on {len(samples)} zh/en/mixed samples: OK")
-
-
-# --------------------------------------------------------------------------- #
-# parity vs HF tokenizers (ground truth)
-# --------------------------------------------------------------------------- #
 
 CORPUS = [
     "Hello world!",
@@ -212,10 +167,8 @@ CORPUS = [
     "",
 ]
 
-
 def test_parity_hf():
-    """Compare token ids against HF tokenizers on the real checkpoint vocab:
-    31 curated cases + decode parity + 400 fuzz strings."""
+    """Compare token ids against HF tokenizers on the real checkpoint vocab:"""
     if not os.path.isdir(MODEL_DIR):
         print("  [skip] model dir not present")
         return
@@ -235,7 +188,7 @@ def test_parity_hf():
     for _ in range(400):
         s = "".join(rng.choice(rng.choice(pools)) for _ in range(rng.randint(0, 60)))
         try:
-            s.encode("utf-8")  # drop lone surrogates (HF rejects them)
+            s.encode("utf-8")
         except UnicodeEncodeError:
             continue
         fuzz.append(s)
@@ -296,9 +249,6 @@ json.dump({"enc": out, "dec": dec}, open(sys.argv[2], "w"))
           f"cases encode 100% identical, decode 100% identical "
           f"({sum(len(x) for x in ref['enc'])} tokens total)")
 
-
-
-
 def main_bpe() -> int:
     print(f"[{os.path.basename(__file__)}]")
     test_tiny_bpe_merges()
@@ -307,23 +257,14 @@ def main_bpe() -> int:
     print("ALL TESTS PASSED")
     return 0
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_normalizer.py ----
-# ------------------------------------------------------------------------- #
-
-
-
 def test_builtin_cases():
-    """The vendored script's own 38 cases, incl. idempotence checks."""
+    """The vendored script's own 38 cases, incl."""
     run_tests()
     assert len(TEST_CASES) == 38
     print(f"  vendored run_tests(): all {len(TEST_CASES)} cases passed (incl. idempotence)")
 
-
 def test_parity_with_reference():
-    """Byte-identical vendoring => must match the reference implementation on
-    built-in cases + stress inputs + 200 fuzz strings (and their re-normalization)."""
+    """Byte-identical vendoring => must match the reference implementation on built-in cases + stress inputs + 200 fuzz stri..."""
     if not os.path.exists(REF_SCRIPT):
         print("  [skip] reference script not present")
         return
@@ -357,13 +298,10 @@ def test_parity_with_reference():
         a = ref.normalize_tts_text(c)
         b = normalize_tts_text(c)
         assert a == b, f"case #{i} mismatch: {c!r}: {a!r} != {b!r}"
-        # idempotence parity
+
         assert ref.normalize_tts_text(a) == normalize_tts_text(b), \
             f"case #{i} idempotence mismatch"
     print(f"  parity vs reference: {len(cases)} cases (incl. 200 fuzz) ALL MATCH")
-
-
-
 
 def main_normalizer() -> int:
     print(f"[{os.path.basename(__file__)}]")
@@ -371,13 +309,6 @@ def main_normalizer() -> int:
     test_parity_with_reference()
     print("ALL TESTS PASSED")
     return 0
-
-
-# ------------------------------------------------------------------------- #
-# ---- from test_prompt.py ----
-# ------------------------------------------------------------------------- #
-
-
 
 class _CaptureTokenizer:
     """Stub tokenizer that records the prompt string handed to encode()."""
@@ -388,7 +319,6 @@ class _CaptureTokenizer:
     def encode(self, text: str) -> list[int]:
         self.last_text = text
         return list(range(10, 10 + len(text)))
-
 
 def test_template_rendering():
     tok = _CaptureTokenizer()
@@ -412,13 +342,11 @@ def test_template_rendering():
     assert out["attention_mask"].shape == (1, len(tok.last_text))
     print("  <user_inst> template + chat template rendering: OK")
 
-    # str() semantics: int tokens / language must render like the reference
     tok2 = _CaptureTokenizer()
     build_tts_prompt("hi", tokens=512, language="French", tokenizer=tok2)
     assert "- Tokens:\n512\n" in tok2.last_text
     assert "- Language:\nFrench\n" in tok2.last_text
     print("  str(tokens=512) / str(language='French') rendering: OK")
-
 
 def test_tensor_contract():
     bpe = default_tokenizer()
@@ -429,7 +357,7 @@ def test_tensor_contract():
     L = ids.shape[1]
     assert ids.shape == (1, L, 33) and mask.shape == (1, L)
     assert bool(mask.all()), "single sample must be all-True mask"
-    # channel 0 == BPE ids of the rendered prompt; channels 1..32 == 1024
+
     prompt_str = (
         "<|im_start|>user\n"
         + _render_user_inst("你好，世界！")
@@ -442,17 +370,15 @@ def test_tensor_contract():
     assert L == len(want_ids)
     print(f"  tensor contract: [1,{L},33] int64, ch0=BPE ids ({L}), ch1..32==1024, mask all-True")
 
-
 def test_normalizer_applied():
     tok = _CaptureTokenizer()
     build_tts_prompt("这 是  mixed   空白 text", tokenizer=tok)
     assert "- Text:\n这是 mixed 空白 text\n" in tok.last_text, tok.last_text
-    # injectable normalizer must override the default
+
     tok2 = _CaptureTokenizer()
     build_tts_prompt("RAW", normalizer=lambda t: f"[{t}]", tokenizer=tok2)
     assert "- Text:\n[RAW]\n" in tok2.last_text
     print("  default normalize_tts_text applied / injectable normalizer: OK")
-
 
 def test_parity_reference_processor():
     """Run the actual MossTTSDelayProcessor (HF, venv-hf) and compare input_ids."""
@@ -504,7 +430,7 @@ for text, language, ntok in cases:
 json.dump(results, open(sys.argv[2], "w"))
 import torch  # noqa: E402  (import here so build_tts_prompt import stays clean)
 """
-    # NB: torch import inside script must happen before use; rewrite to top-import
+
     script = "import torch\n" + script.replace(
         "import torch  # noqa: E402  (import here so build_tts_prompt import stays clean)\n", "")
     cases = [
@@ -540,9 +466,6 @@ import torch  # noqa: E402  (import here so build_tts_prompt import stays clean)
     print(f"  parity vs MossTTSDelayProcessor (HF): {n_ok}/{len(results)} cases "
           f"input_ids+mask 100% identical (lengths: {[x['len'] for x in results]})")
 
-
-
-
 def main_prompt() -> int:
     print(f"[{os.path.basename(__file__)}]")
     test_template_rendering()
@@ -552,23 +475,15 @@ def main_prompt() -> int:
     print("ALL TESTS PASSED")
     return 0
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_prompt_continuation.py ----
-# ------------------------------------------------------------------------- #
-
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 
 def _check_diagonal(unified: torch.Tensor, prefix: torch.Tensor,
                     audio_start_idx: int) -> None:
-    """Verify that the prompt's audio channels hold the exact truncated delay
-    pattern of prefix[T, 32]."""
+    """Verify that the prompt's audio channels hold the exact truncated delay pattern of prefix[T, 32]."""
     T, n_vq = prefix.shape
-    audio = unified[audio_start_idx + 1:, 1:]  # [T, 32]
+    audio = unified[audio_start_idx + 1:, 1:]
     assert audio.shape == (T, n_vq), (audio.shape, (T, n_vq))
-    # In the truncated delayed stream (first T rows), delayed[i, ch] is
-    # prefix[i - ch, ch] when i >= ch, else pad (1024).
+
     for i in range(T):
         for ch in range(n_vq):
             val = int(audio[i, ch])
@@ -579,7 +494,6 @@ def _check_diagonal(unified: torch.Tensor, prefix: torch.Tensor,
             else:
                 assert val == AUDIO_PAD_CODE, (
                     f"row={i} ch={ch}: got {val}, expected pad {AUDIO_PAD_CODE}")
-
 
 def test_golden_parity() -> None:
     """100% bitwise parity with the reference processor."""
@@ -608,13 +522,11 @@ def test_golden_parity() -> None:
         our_ids = out["input_ids"]
         our_attn = out["attention_mask"]
 
-        # 1. shape match
         assert our_ids.shape == ref_ids.shape, (
             f"[{name}] shape mismatch: ours={our_ids.shape} ref={ref_ids.shape}")
         assert our_attn.shape == ref_attn.shape, (
             f"[{name}] attn shape mismatch: ours={our_attn.shape} ref={ref_attn.shape}")
 
-        # 2. bitwise parity on input_ids
         diff = (our_ids != ref_ids)
         if diff.any():
             n_diff = int(diff.sum())
@@ -625,10 +537,8 @@ def test_golden_parity() -> None:
                 f"ch={ch}: ours={int(our_ids[0, first_pos, ch])} "
                 f"ref={int(ref_ids[0, first_pos, ch])}")
 
-        # 3. attention_mask equality
         assert (our_attn == ref_attn).all(), f"[{name}] attention_mask mismatch"
 
-        # 4. independent structural invariants
         col0 = our_ids[0, :, 0]
         assert int(col0[-1]) == AUDIO_GEN_SLOT_TOKEN_ID, (
             f"[{name}] tail token must be gen_slot (151656), got {int(col0[-1])}")
@@ -637,17 +547,14 @@ def test_golden_parity() -> None:
         start_idx = starts[0]
         assert start_idx == case["audio_start_idx"]
 
-        # User-phase audio channels must be pure pad
         user_audio = our_ids[0, :start_idx + 1, 1:]
         assert (user_audio == AUDIO_PAD_CODE).all(), (
             f"[{name}] non-pad in user-phase audio channels")
 
-        # Diagonal delay pattern matches prefix
         _check_diagonal(our_ids[0], prefix, start_idx)
 
         print(f"  [OK] {name}: L={our_ids.shape[1]} (100% bitwise parity, "
               f"start={start_idx}, gen_slots={(col0 == AUDIO_GEN_SLOT_TOKEN_ID).sum()})")
-
 
 def test_delay_pattern_helper() -> None:
     """Standalone unit test for apply_delay_pattern."""
@@ -660,22 +567,21 @@ def test_delay_pattern_helper() -> None:
         assert (delayed[ch + 10:, ch] == 1024).all()
     print("  [OK] apply_delay_pattern standalone unit test passed")
 
-
 def test_argument_guards() -> None:
     """Ensure invalid inputs fail fast with clear ValueError."""
-    # Bad dim
+
     try:
         build_continuation_prompt("foo", prefix_codes=torch.zeros(10))
         assert False, "expected ValueError"
     except ValueError:
         pass
-    # Bad channel count
+
     try:
         build_continuation_prompt("foo", prefix_codes=torch.zeros(40, 16))
         assert False, "expected ValueError"
     except ValueError:
         pass
-    # Too short (< N_VQ)
+
     try:
         build_continuation_prompt("foo", prefix_codes=torch.zeros(10, 32))
         assert False, "expected ValueError"
@@ -683,18 +589,12 @@ def test_argument_guards() -> None:
         pass
     print("  [OK] argument guard tests passed")
 
-
 def main_continuation() -> int:
     test_delay_pattern_helper()
     test_argument_guards()
     test_golden_parity()
     print("[test_prompt_continuation] ALL TESTS PASSED.")
     return 0
-
-
-# --------------------------------------------------------------------------- #
-# Unified entry point: each source file's own entry function, in order.
-# --------------------------------------------------------------------------- #
 
 def main() -> int:
     rc = 0
@@ -704,7 +604,6 @@ def main() -> int:
     rc |= main_continuation() or 0
 
     return rc
-
 
 if __name__ == "__main__":
     sys.exit(main())

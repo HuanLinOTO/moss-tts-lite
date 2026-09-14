@@ -1,25 +1,4 @@
-"""Native-operator fast decode for MOSS-TTS (whole-step CUDA graph, W4).
-
-`FastNativeTTS` decodes with a single whole-step CUDA graph per cache length
-and a reduced kernel count (fused GEMMs/heads, ``F.rms_norm``, table-gather
-rope): ~98 steps/s on an A10G vs fast.py's ~82.  It is NOT bitwise to the
-reference (argmax 100%, top-25 gate agreement >= 97.5%); use the default
-fast.py path when exact reproduction matters.
-
-Design constraints that must not be violated when editing this module:
-
-- Attention keeps fast.py's exact-length call inside the graph; one graph per
-  cache length (`bucket_for` records why padded/bucketed alternatives were
-  measured and rejected); `max_graphs` bounds the graph cache.
-- Sampling stays OUTSIDE the graph (fast.py's exact call sequence, RNG stream
-  preserved); arm n3 moved it in and was rejected -- the channel-supset draw
-  order made trajectories run away.  See `ARMS["n3"]`.
-- `_rms_norm` is kept in `prefill`, where a per-step difference compounds
-  into a different utterance.
-
-Measured numbers, the n1/n2/n3 ablation, and the bug history live in
-docs/design/fast-native.md.
-"""
+"""Native-operator fast decode for MOSS-TTS (whole-step CUDA graph, W4)."""
 
 from __future__ import annotations
 
@@ -53,11 +32,6 @@ from .sampling import sample_token
 
 _INT64_MAX = 9223372036854775807
 
-#: decode arms
-#:   n1 = whole-step graph only: one graph per step (attention still fast.py's
-#:        exact-length call), everything else exactly as `fast.py` does it
-#:   n2 = n1 + fused heads + fused (q,k)/(gate,up) int4 GEMMs + `F.rms_norm`
-#:   n3 = n2 + tensorized delay FSM + batched in-graph sampling
 ARMS: dict[str, dict] = {
     "n1": dict(legacy=True, fuse_heads=False, fuse_gemms=False,
                fused_norm=False, in_graph_sample=False),
@@ -67,36 +41,16 @@ ARMS: dict[str, dict] = {
                 fused_norm=False, in_graph_sample=False),
     "n2": dict(legacy=False, fuse_heads=True, fuse_gemms=True,
                fused_norm=True, in_graph_sample=False),
-    # n3 (in-graph sampling) reorders the RNG stream and trajectories run
-    # away; kept unfollowed only for reference.  n2 is the default.
+
     "n3": dict(legacy=False, fuse_heads=True, fuse_gemms=True,
                fused_norm=True, in_graph_sample=True),
 }
 
-#: host-facing device readback: [next_text, audio0..31, al, dl, is_audio]
 _HSYNC = N_VQ + 4
-
 
 def text_decision(dl: int, n_vq: int, wd_stop: bool, is_stopping: bool,
                   is_audio: bool):
-    """The delay-ramp text decision, isolated so it can be tested as a table.
-
-    Mirrors `generate_fast`'s branch order exactly.  The `not is_stopping`
-    guards on the two forced branches are the subtle part: the forced delay
-    ramp is what *closes* the delay pattern, but once `IM_END` has been decided
-    the reference stops forcing either branch, so a step that already reached
-    `dl == n_vq` falls through to light sampling instead of being pinned to
-    `audio_end` (and `sampling_text` turns the sampling block back on, which is
-    what keeps the RNG stream aligned with the reference).  Note the honest
-    scope: on the golden zh/en prompts both variants happen to reach the same
-    step count, so this is pinned by `tests/test_fast.py` phase C as a
-    differential table against the reference branch block, not by an observed
-    step-count difference.
-
-    Returns `(next_text, is_audio, sampling_text, forced)`; `forced` says no
-    sampling call may consume RNG this step (the reference gates its whole
-    sampling block on `sampling_text`).
-    """
+    """The delay-ramp text decision, isolated so it can be tested as a table."""
     if wd_stop:
         if dl == _INT64_MAX or dl < n_vq:
             return AUDIO_DELAY_SLOT_TOKEN_ID, is_audio, False, True
@@ -108,53 +62,15 @@ def text_decision(dl: int, n_vq: int, wd_stop: bool, is_stopping: bool,
     sampling_text = (not is_stopping) and (not wd_stop) and dl > n_vq
     return PAD_TOKEN_ID, is_audio, sampling_text, False
 
-
 def audio_sampling_mask(al: int, dl: int, n_vq: int) -> list[bool]:
-    """Per-channel sampling mask: `al > j` and (dl == MAX or `j > dl - 1`).
-
-    The host mirror of `generate.py`'s `pre_audio_mask & post_audio_mask` for
-    batch=1, matching `generate_fast`.
-    """
+    """Per-channel sampling mask:"""
     return [(al > j) and (dl == _INT64_MAX or j > dl - 1) for j in range(n_vq)]
 
-
 class FastNativeTTS:
-    """Whole-step-graph decoder; weight container is a `FastMossTTS`.
-
-    Usage::
-
-        base = load_gptq_fast(model, state)      # or FastMossTTS(model, quant="w4")
-        native = FastNativeTTS(base, arm="n3")
-        res = generate_native(native, prompt, ...)
-
-    With `fuse_gemms=True` the packed `(q,k)` and `(gate,up)` payloads are
-    replaced by concatenated copies and the per-name originals dropped, so
-    `base` is only a weight container afterwards (which is all this module
-    uses it for).
-    """
+    """Whole-step-graph decoder;"""
 
     def __init__(self, base: FastMossTTS, arm: str = "n2", max_graphs: int = 64):
-        """Args:
-            max_graphs: cap on captured graphs.  Each whole-step graph costs
-                ~6-7.5 MiB of device memory in the shared graph pool (the ~1000
-                kernel nodes' parameters and work descriptors; their activations
-                sum to under 1 MiB), so the cap is a memory/latency tradeoff:
-                one graph is captured per decoded length, and beyond the cap the
-                least recently used graph is dropped and re-captured on demand
-                (~40-80 ms each, which is why a trajectory much longer than the
-                cap degrades badly -- the cache thrashes).
-
-                Default 64 (~0.5 GiB of pool): a one-shot CLI call captures
-                every length exactly once anyway, so the cap only bounds what
-                stays resident, and 64 covers a 5 s utterance before the first
-                re-capture.  Measured on the w1p path
-                (measured): 256 -> 64 changes neither the
-                per-step cost of the first capture-sweep nor the re-capture
-                cost once the cap is exceeded (both are the same
-                `_capture()`), it only lowers the resident pool.  Raise it
-                (e.g. 256, ~2 GiB) in a long-lived server that synthesizes
-                repeatedly and wants the graphs to stay warm.
-        """
+        """Args:"""
         if arm not in ARMS:
             raise ValueError(f"unknown arm {arm!r} (expected one of {sorted(ARMS)})")
         cfg = ARMS[arm]
@@ -170,7 +86,7 @@ class FastNativeTTS:
         self.fused_norm = bool(cfg["fused_norm"])
         self.in_graph_sample = bool(cfg["in_graph_sample"])
         self.scale = 1.0 / math.sqrt(m.head_dim)
-        # sampling parameters (overwritten by generate_native)
+
         self.text_temperature = 1.5
         self.text_top_p = 1.0
         self.text_top_k = 50
@@ -178,22 +94,17 @@ class FastNativeTTS:
         self.audio_top_p = 0.8
         self.audio_top_k = 25
 
-        #: the base's input/pos buffers are reused so arm n1 can call fast.py's
-        #: own piece functions verbatim and still read the same row
-        #: (`base.capture()` is never used on the native path)
         self.ids_row = base.ids_row
         self.pos_dev = base.pos_dev
 
-        # ---- replay outputs -------------------------------------------------
         self.la_buf = torch.zeros(N_VQ, AUDIO_PAD_CODE + 1, dtype=m.dtype, device=dev)
         self.two_buf = torch.zeros(2, dtype=m.dtype, device=dev)
         self.lt_buf = torch.zeros(m.text_vocab, dtype=m.dtype, device=dev)
         self.hsync = torch.zeros(_HSYNC, dtype=torch.long, device=dev)
-        #: device FSM [audio_lengths, delayed_lengths, is_audio]
+
         self.fsm = torch.zeros(3, dtype=torch.long, device=dev)
         self.seq_len = 0
 
-        # ---- weights: fused heads, fused int4 GEMMs -------------------------
         self.W_audio = m.head_audio.reshape(N_VQ * (AUDIO_PAD_CODE + 1), m.hidden_size)
         self.W_two = m.head_2way
         self.qk_fused: list = [None] * m.n_layers
@@ -201,13 +112,6 @@ class FastNativeTTS:
         if self.fuse_gemms:
             self._build_fused_gemms()
 
-        # ---- packed rope: one table holds (cos, -sin reordered) -------------
-        # rotate_half(x) == x[..., perm] * sgn with perm = [half..D) ++ [0..half)
-        # and sgn = [-1]*half ++ [+1]*half, so cos and sin_signed can be
-        # gathered together as a single [max_seq, 2, head_dim] table and the
-        # whole rope collapses to 1 gather + 2 muls + 1 add per tensor instead
-        # of gathering cos and sin separately and building rotate_half with a
-        # chunk/cat/neg chain (bitwise-equal: negation is exact in bf16).
         half = m.head_dim // 2
         self.rope_perm = torch.cat((torch.arange(half, m.head_dim, device=dev),
                                     torch.arange(0, half, device=dev)))
@@ -218,11 +122,10 @@ class FastNativeTTS:
             self.rope_tab = torch.stack((m.rope_cos, m.rope_sin * sgn), 1)
             self.rope_signed_sin = sgn
 
-        # ---- fused audio embedding table (33 gathers -> 2 + 1 sum) ----------
         self.emb_audio = None
         self.emb_offs = None
         if not self.legacy:
-            self.emb_audio = torch.cat(m.emb_ext, 0).contiguous()  # [32*1025, H]
+            self.emb_audio = torch.cat(m.emb_ext, 0).contiguous()
             self.emb_offs = (torch.arange(N_VQ, device=dev, dtype=torch.long)
                              * m.emb_ext[0].shape[0]).view(1, 1, -1)
 
@@ -231,7 +134,6 @@ class FastNativeTTS:
         self._pool = torch.cuda.graph_pool_handle()
         self._capture_stream = torch.cuda.Stream()
 
-    # ------------------------------------------------------------------ setup
     def _quant_rec(self, li: int, name: str):
         qd = self.base.qlayers[li] if self.base.qlayers else None
         if not qd or name not in qd:
@@ -242,13 +144,7 @@ class FastNativeTTS:
         return packed, qsz, g
 
     def _build_fused_gemms(self) -> None:
-        """Concat `(q,k)` / `(gate,up)` int4 payloads into single-GEMM weights.
-
-        Requires both members to be int4 with the same group size (the w1p
-        GPTQ state deliberately keeps `v_proj` bf16, and `v` is never fused).
-        Output-row concatenation leaves every row's K-loop untouched, so the
-        result is bitwise-identical to the two separate GEMMs.
-        """
+        """Concat `(q,k)` / `(gate,up)` int4 payloads into single-GEMM weights."""
         m = self.m
         for li in range(m.n_layers):
             for key, grp in (("qk", ("q", "k")), ("gu", ("gate", "up"))):
@@ -264,7 +160,6 @@ class FastNativeTTS:
                     qd.pop(n, None)
         torch.cuda.empty_cache()
 
-    # ------------------------------------------------------------- primitives
     def _lin(self, x, li: int, name: str):
         return self.base._linear(x, li, name)
 
@@ -281,20 +176,8 @@ class FastNativeTTS:
             return F.rms_norm(x, (x.shape[-1],), w, 1e-6)
         return _rms_norm(x, w)
 
-    # ------------------------------------------------------------------ step
     def _step_fn(self, audio2: bool, length: int):
-        """Build the whole-step closure captured for one (audio2, length).
-
-        `length` is the KV length this graph's attention reads, i.e. the
-        position being decoded is `length - 1` and every replay of this graph
-        must use that same position (the attention shape is baked in).
-
-        `legacy` (arm n1) reuses `fast.py`'s own piece functions -- static
-        ping-pong buffers, the 6-op rms chain, per-head audio GEMMs -- so the
-        ablation isolates the graph structure alone.  `legacy=False` uses this
-        module's streamlined sequence (locals instead of static buffers,
-        `F.rms_norm`, fused heads, fused int4 GEMMs), which is arms n2/n3.
-        """
+        """Build the whole-step closure captured for one (audio2, length)."""
         m = self.m
         N = N_VQ
         base = self.base
@@ -304,16 +187,13 @@ class FastNativeTTS:
         sample = self.in_graph_sample and audio2
         ids = self.ids_row
         pos = self.pos_dev
-        # above `gqa_max_len` the reference switches attention mode (flash
-        # tiling changes at len 641), so the graph must switch with it
+
         use_gqa = base.enable_gqa and length <= base.gqa_max_len
 
         def legacy_step() -> None:
             base._p_embed()
             base._p_pre(0)
-            # above `gqa_max_len` fast.py switches to repeat_interleave
-            # (flash tiling changes at len 641); mirror it or n1 stops being
-            # bitwise-equal to the reference past that length
+
             use_gqa = base.enable_gqa and length <= base.gqa_max_len
             for li in range(m.n_layers):
                 keys = m.k_cache[li, :, :length].unsqueeze(0)
@@ -331,11 +211,10 @@ class FastNativeTTS:
                 if li + 1 < m.n_layers:
                     base._p_pre(li + 1)
             if audio2:
-                base._p_final_audio2()          # 2-way text head + 32 audio heads
+                base._p_final_audio2()
             else:
                 base._p_final()
-            # uniform readout: the legacy pieces write into fast.py's static
-            # buffers, so mirror them into this module's outputs
+
             self.two_buf.copy_(base.two_static)
             self.lt_buf.copy_(base.lt_static)
             self.la_buf.copy_(base.la_static)
@@ -346,8 +225,7 @@ class FastNativeTTS:
                 for i in range(N):
                     h = h + F.embedding(ids[..., i + 1], m.emb_ext[i])
             else:
-                # one gather into the stacked audio table + one reduction,
-                # instead of 32 gathers and 32 (dependency-chained) adds
+
                 h = F.embedding(ids[..., 0], m.embed_tokens)
                 h = h + F.embedding(ids[..., 1:] + self.emb_offs,
                                     self.emb_audio).sum(-2, keepdim=True)
@@ -425,22 +303,8 @@ class FastNativeTTS:
 
         return fn
 
-    # -------------------------------------------------- tensorized FSM (n3)
     def _fsm_and_sample(self) -> None:
-        """Delay FSM + batched sampling, entirely inside the captured graph.
-
-        Only used in the audio phase (the 2-way text head is the only head the
-        reference consults there).  Mirrors `generate.py`:
-          * `delayed_lengths < n_vq` forces the delay-slot ramp, `== n_vq`
-            emits audio_end and clears `is_audio`;
-          * channel j samples iff `audio_lengths > j` and the delay mask allows
-            it; every other channel gets the pad code;
-          * `audio_lengths` counts audio rows and resets on audio_end;
-          * `delayed_lengths` MAX -> 0 -> +1 -> wraps back to MAX above n_vq.
-
-        RNG note: all 32 channels are drawn every step, so the stream differs
-        from the reference's channel-loop draws (approved deviation).
-        """
+        """Delay FSM + batched sampling, entirely inside the captured graph."""
         N = N_VQ
         fsm = self.fsm
         al = fsm[0]
@@ -449,7 +313,6 @@ class FastNativeTTS:
         maxv = torch.full_like(dl, _INT64_MAX)
         zero = torch.zeros_like(dl)
 
-        # ---- text token -----------------------------------------------------
         two = self.two_buf.float() / self.text_temperature
         pick = torch.multinomial(torch.softmax(two, -1), 1)[0]
         sampled = torch.where(pick == 0,
@@ -460,13 +323,9 @@ class FastNativeTTS:
                              torch.full_like(dl, AUDIO_END_TOKEN_ID))
         next_text = torch.where(dl > N, sampled, forced)
 
-        # ---- audio tokens ---------------------------------------------------
         la = self.la_buf.float() / self.audio_temperature
         if 0 < self.audio_top_k < la.shape[-1]:
-            # exactly `sampling.apply_top_k`: scatter the VALUES of the k
-            # largest entries back, because ties at the k-th value are common
-            # on this model (32/32 channels) and a `>= kth` rule would keep
-            # 25-51 entries instead of 25.
+
             vals, idx = torch.topk(la, self.audio_top_k, dim=-1)
             keep = torch.full_like(la, float("-inf")).scatter(-1, idx, vals)
             la = keep
@@ -487,7 +346,6 @@ class FastNativeTTS:
         self.ids_row.copy_(torch.cat(
             (next_text.view(1, 1, 1), next_audio.view(1, 1, N)), dim=2))
 
-        # ---- FSM update (reference order) -----------------------------------
         inc = ((next_text == AUDIO_START_TOKEN_ID)
                | (next_text == AUDIO_GEN_SLOT_TOKEN_ID)
                | (next_text == AUDIO_DELAY_SLOT_TOKEN_ID)).long()
@@ -508,21 +366,8 @@ class FastNativeTTS:
         self.hsync[2 + N].copy_(dl2)
         self.hsync[3 + N].copy_(is_audio2.long())
 
-    # ------------------------------------------------------------- bucketing
-    #: Why one graph per cache length instead of a fixed bucket ladder:
-    #: attention must read exactly the first `length` K/V rows to reproduce the
-    #: reference numerics; padded/bucketed alternatives break bitwise equality
-    #: -- a zero pad row scores 0, which the softmax weights as `exp(-lse)`, and
-    #: on this model that share reaches 0.85-1.0 (the attention logit spread is
-    #: large), so pad rows can dominate the output; a `bucket`-sized `-inf`
-    #: mask needs the dynamic length, `seqused_k` is silently ignored by the
-    #: dense flash path, and the varlen path changes the kernel (4.9e-4 output
-    #: drift) at 2x the cost.  Capturing per length keeps attention identical
-    #: to `fast.py`'s call while still collapsing a step's ~2300 kernels into
-    #: one replay.
     def bucket_for(self, length: int) -> int:
-        """This design needs the graph's attention length to equal the cache
-        length, so the "bucket" is the length itself."""
+        """This design needs the graph's attention length to equal the cache length, so the "bucket" is the length itself."""
         return length
 
     def _capture(self, length: int, audio2: bool) -> torch.cuda.CUDAGraph:
@@ -540,10 +385,8 @@ class FastNativeTTS:
         torch.cuda.synchronize()
         return g
 
-    # ------------------------------------------------------------------- api
     def prefill(self, input_ids: torch.Tensor):
-        """Run the prefill with this module's own primitives (the fused weights
-        make `base.prefill` unusable once `fuse_gemms` has run)."""
+        """Run the prefill with this module's own primitives (the fused weights make `base."""
         m = self.m
         if input_ids.dim() != 3 or input_ids.shape[0] != 1 \
                 or input_ids.shape[-1] != N_VQ + 1:
@@ -564,25 +407,12 @@ class FastNativeTTS:
         h = _rms_norm(h, m.final_norm)
         m._seq = t
         self.seq_len = t
-        # NOTE: captured graphs are *not* invalidated here.  They are keyed by
-        # (cache length, phase) and read the cache/position through buffers, so
-        # a new utterance at the same lengths reuses them -- which is what makes
-        # per-length capture affordable across calls (the first call pays the
-        # capture cost, later ones replay only).
+
         self.set_fsm(0, _INT64_MAX, False)
         return HiddenState(h)
 
     def _layer_prefill(self, li: int, h: torch.Tensor, t: int) -> torch.Tensor:
-        """One layer over the whole prompt (mirrors `fast._layer_q`).
-
-        Norms deliberately use the *reference* `_rms_norm` chain, not
-        `F.rms_norm`: the prefill sets the KV cache and the prompt's last
-        hidden state for the whole decode, so any per-step numerical difference
-        here compounds into a different trajectory (measured: 5.0 hidden
-        difference -> 164 vs 133 steps).  The decode step may use the faster
-        kernel because its gate is per-step quality, but the prefill must match
-        `fast.py` bit-for-bit or the two paths decode different utterances.
-        """
+        """One layer over the whole prompt (mirrors `fast."""
         m = self.m
         lyr = m.layers[li]
         residual = h
@@ -624,7 +454,7 @@ class FastNativeTTS:
         return residual + self._lin(F.silu(g) * u, li, "down")
 
     def replay(self, pos: int, audio2: bool, row: torch.Tensor | None = None) -> None:
-        """One whole-step graph replay; `pos` = cache slot the fed row occupies."""
+        """One whole-step graph replay;"""
         length = pos + 1
         if length < 1 or length > self.m.max_seq_len:
             raise ValueError(f"position {pos} outside the KV cache")
@@ -635,8 +465,7 @@ class FastNativeTTS:
         g = self.graphs.get(key)
         if g is None:
             if len(self.graphs) >= self.max_graphs:
-                # graphs share one pool, so an evicted graph's memory returns
-                # to the pool for the next capture
+
                 self.graphs.pop(next(iter(self.graphs)))
             g = self._capture(length, audio2)
             self.graphs[key] = g
@@ -646,7 +475,7 @@ class FastNativeTTS:
         return len(self.graphs)
 
     def read_hsync(self):
-        """One small D2H: (next_text, audio[N_VQ], al, dl, is_audio)."""
+        """One small D2H:"""
         v = self.hsync.cpu()
         return (int(v[0]), v[1:1 + N_VQ].clone(), int(v[1 + N_VQ]),
                 int(v[2 + N_VQ]), int(v[3 + N_VQ]))
@@ -656,8 +485,6 @@ class FastNativeTTS:
         self.fsm[1] = dl
         self.fsm[2] = 1 if is_audio else 0
 
-
-# --------------------------------------------------------------- generation
 @torch.inference_mode()
 def generate_native(
     native: FastNativeTTS,
@@ -678,15 +505,7 @@ def generate_native(
     watchdog_max_segment_frames: int | None = None,
     max_requested_pause_s: float | None = None,
 ) -> GenResult:
-    """Delay-pattern generation on `FastNativeTTS`.
-
-    Semantically mirrors `moss_tts_lite.fast.generate_fast` (same forced-token
-    ramp, same masks, same watchdog); the host mirror of the delay FSM is
-    authoritative and is pushed into the device FSM before every replay, so the
-    two cannot drift.  In arm n3 the audio-phase step is resolved on device and
-    one small D2H read supplies the host with the emitted row, the FSM counters
-    and ch0 for the watchdog.
-    """
+    """Delay-pattern generation on `FastNativeTTS`."""
     model = native.m
     input_ids = prompt["input_ids"]
     attention_mask = prompt.get("attention_mask")
@@ -743,7 +562,6 @@ def generate_native(
 
     torch.manual_seed(seed)
 
-    # ---- host mirror of the delay FSM --------------------------------------
     col0 = input_ids[0, :, 0]
     last0 = int(col0[-1])
     is_continuation = last0 in (AUDIO_START_TOKEN_ID, AUDIO_GEN_SLOT_TOKEN_ID)
@@ -785,11 +603,7 @@ def generate_native(
             native.replay(pos, audio2=bool(is_audio))
             pos += 1
             if in_graph and is_audio:
-                # arm n3: the graph sampled the whole row and advanced the
-                # device FSM, so both the row and the counters come from it.
-                # The watchdog must still run here: it is what bounds a
-                # degenerate trajectory, and skipping it is what made n3 run
-                # away to thousands of steps.
+
                 _t1(e0, "step")
                 next_text, audio_row, al_dev, dl_dev, au_dev = native.read_hsync()
                 al, dl, is_audio = al_dev, dl_dev, bool(au_dev)
@@ -822,24 +636,17 @@ def generate_native(
                 if is_stopping:
                     break
                 if wd_stop:
-                    # drive the delay ramp to audio_end the same way the host
-                    # path does, by forcing the row and letting the FSM run
+
                     native.ids_row[..., 0] = (
                         AUDIO_DELAY_SLOT_TOKEN_ID if (dl == _INT64_MAX or dl < N_VQ)
                         else AUDIO_END_TOKEN_ID)
                     native.ids_row[..., 1:] = AUDIO_PAD_CODE
                 continue
-            # The whole-step graph computes EVERY head, so both readouts are
-            # always available from this replay; take both unconditionally.
-            # (An earlier revision only took `two_step` in the audio phase,
-            # which left `la_step = None` and made the audio tokens fall back
-            # to `model.audio_logits(h)` on the *prefill* hidden state -- the
-            # stale-head bug.)
+
             two_step = native.two_buf
             la_step = native.la_buf
         _t1(e0, "prefill" if time_step == 0 else "step")
 
-        # ---- text token decision (verbatim mirror of generate_fast) --------
         next_text, is_audio, sampling_text, _forced = text_decision(
             dl, N_VQ, wd_stop, is_stopping, is_audio)
 
@@ -847,8 +654,7 @@ def generate_native(
             if is_audio:
                 two_raw = two_step if two_step is not None \
                     else F.linear(h[0], model.head_2way)
-                # bf16 division, as the reference does (fp32 here changes the
-                # sampled token and hence the RNG stream)
+
                 two = two_raw / text_temperature
                 if time_step == 0:
                     two = two.clone()
@@ -879,7 +685,6 @@ def generate_native(
         if next_text == IM_END_TOKEN_ID:
             is_stopping = True
 
-        # ---- audio tokens ---------------------------------------------------
         smask = audio_sampling_mask(al, dl, N_VQ)
         next_audio_tokens = torch.full((1, N_VQ), AUDIO_PAD_CODE, device=device,
                                        dtype=torch.long)
@@ -902,7 +707,6 @@ def generate_native(
                     next_audio_tokens[0, j] = int(tok[k])
         ch0_val = int(next_audio_tokens[0, 0])
 
-        # ---- watchdog -------------------------------------------------------
         if watchdog and not wd_stop and is_audio and dl == _INT64_MAX:
             if ch0_val in _WD_LOW_ENERGY_CH0:
                 wd_silent_run += 1
@@ -921,7 +725,6 @@ def generate_native(
                             "segment_bound_frames": seg_bound,
                             "max_requested_pause_s": max_requested_pause_s}
 
-        # ---- counters (reference order) -------------------------------------
         if next_text in (AUDIO_START_TOKEN_ID, AUDIO_GEN_SLOT_TOKEN_ID,
                          AUDIO_DELAY_SLOT_TOKEN_ID):
             al += 1

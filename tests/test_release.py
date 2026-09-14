@@ -1,26 +1,10 @@
-"""Release gates: dependency purity, standalone export, VRAM budget.
-
-Dependency purity of moss_tts_lite/, the standalone-export format and
-round-trip (E1..E6), and the kvfit VRAM work: pure-arithmetic KV
-sizing (Phase 0, no GPU) followed by the measured-peak and 8 GB card
-simulation gates (Phase 1/2, GPU under the lock).
-
-Consolidated from:
-  test_dep_purity.py
-  test_export.py
-  test_vram_budget.py
-
-Run:
-  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_release.py
-"""
+"""Release gates:"""
 
 from __future__ import annotations
 
 import os
 import sys
 
-# `python3 tests/<this file>.py` straight from the repo root must import
-# moss_tts_lite without an explicit PYTHONPATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import ast
@@ -48,15 +32,10 @@ from moss_tts_lite.model import MossTTSModel
 from moss_tts_lite.prompt import build_tts_prompt
 from moss_tts_lite.st_loader import read_safetensors, safetensors_header
 
-# --------------------------------------------------------------------------- #
-# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
-# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
-# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
-# --------------------------------------------------------------------------- #
 ROOT = os.environ.get("MOSS_TTS_ROOT",
                       os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 LITE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-REPO = LITE_ROOT                 # this repo: export.py / README_hf.md live here
+REPO = LITE_ROOT
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
 STATE = os.path.join(MODEL_DIR, "gptq", "w1p.pt")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
@@ -66,18 +45,11 @@ MAXNEW = 4096
 OUT = os.path.join(ROOT, ".tmp", "kvfit_agent", "wav")
 TEMPLATE = os.path.join(REPO, "README_hf.md")
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_dep_purity.py ----
-# ------------------------------------------------------------------------- #
-
 PKG_ROOT = Path(__file__).resolve().parents[1] / "moss_tts_lite"
 ALLOWED_THIRD_PARTY = {"torch", "numpy", "soundfile", "yaml"}
 
-
 def _collect_imports(path: Path) -> list[tuple[str, int, str]]:
-    """Return (top_level_module, lineno, shown_name) for every Import /
-    ImportFrom node anywhere in the file (module body, functions, try/except)."""
+    """Return (top_level_module, lineno, shown_name) for every Import / ImportFrom node anywhere in the file (module body, f..."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: list[tuple[str, int, str]] = []
     for node in ast.walk(tree):
@@ -85,13 +57,12 @@ def _collect_imports(path: Path) -> list[tuple[str, int, str]]:
             for alias in node.names:
                 found.append((alias.name.split(".")[0], node.lineno, alias.name))
         elif isinstance(node, ast.ImportFrom):
-            if node.level > 0:  # relative import: inside the package by definition
+            if node.level > 0:
                 found.append(("moss_tts_lite", node.lineno, "." * node.level + (node.module or "")))
             else:
                 mod = node.module or ""
                 found.append((mod.split(".")[0], node.lineno, mod))
     return found
-
 
 def test_dep_purity():
     stdlib = sys.stdlib_module_names
@@ -99,13 +70,13 @@ def test_dep_purity():
     assert files, f"no .py files found under {PKG_ROOT}"
 
     violations: list[str] = []
-    seen: dict[str, set[str]] = {}   # top-level module -> files importing it
+    seen: dict[str, set[str]] = {}
 
     for f in files:
         rel = f.relative_to(PKG_ROOT.parent).as_posix()
         try:
             imports = _collect_imports(f)
-        except SyntaxError as e:  # pragma: no cover
+        except SyntaxError as e:
             raise AssertionError(f"{rel}: unparsable: {e}") from e
         for top, lineno, name in imports:
             seen.setdefault(top, set()).add(rel)
@@ -127,20 +98,11 @@ def test_dep_purity():
     print(f"  stdlib used ({len(std_used)}): {std_used}")
     assert not other, f"unexpected modules: {other}"
 
-
-
-
 def main_dep_purity() -> int:
     print(f"[{os.path.basename(__file__)}]")
     test_dep_purity()
     print("ALL TESTS PASSED")
     return 0
-
-
-# ------------------------------------------------------------------------- #
-# ---- from test_export.py ----
-# ------------------------------------------------------------------------- #
-
 
 N_LAYERS = 2
 HIDDEN = 256
@@ -157,11 +119,9 @@ _LIN_SHAPE = {"q": (N_HEADS * HEAD_DIM, HIDDEN), "k": (N_KV * HEAD_DIM, HIDDEN),
               "gate": (2 * HIDDEN, HIDDEN), "up": (2 * HIDDEN, HIDDEN),
               "down": (HIDDEN, 2 * HIDDEN)}
 
-
 def _bf16(shape, seed, scale=0.05):
     gen = torch.Generator().manual_seed(seed)
     return (torch.randn(*shape, generator=gen) * scale).to(torch.bfloat16)
-
 
 def _synthetic_base(dirpath: str) -> dict:
     """A miniature MOSS-TTS checkpoint with the exact key naming scheme."""
@@ -182,7 +142,7 @@ def _synthetic_base(dirpath: str) -> dict:
         tensors[f"lm_heads.{i}.weight"] = _bf16((TEXT_VOCAB if i == 0 else 1025, HIDDEN),
                                                  200 + i)
     os.makedirs(dirpath, exist_ok=True)
-    # a single shard + an index (exercises the index-based reader path)
+
     write_safetensors(os.path.join(dirpath, "model.safetensors"), sorted(tensors.items()))
     with open(os.path.join(dirpath, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": {"total_size": sum(
@@ -195,16 +155,8 @@ def _synthetic_base(dirpath: str) -> dict:
             f.write(f"# synthetic {name}\n")
     return tensors
 
-
 def _pack(q, s, mn, kt=8, dev=None):
-    """`pack_fast`, but shape-faithful on a machine without the CUDA kernel.
-
-    `aten._convert_weight_to_int4pack` exists for CUDA (and Meta) only, so on a
-    CPU-only host the *shape* is taken from the Meta backend and the payload is
-    filled with deterministic pseudo-random bytes: the export/format/round-trip
-    logic under test does not care about the values, only about shapes, dtypes
-    and byte fidelity.  With CUDA present the real kernel is used (bit-exact).
-    """
+    """`pack_fast`, but shape-faithful on a machine without the CUDA kernel."""
     if dev is None:
         dev = "cuda" if torch.cuda.is_available() else "cpu"
     if dev == "cpu":
@@ -214,11 +166,10 @@ def _pack(q, s, mn, kt=8, dev=None):
         gen = torch.Generator().manual_seed(int(q.float().abs().sum().item()))
         packed = torch.randint(0, 2**31 - 1, tuple(shp), generator=gen,
                                dtype=torch.int32)
-        kk = q.shape[1] // s.shape[1]  # noqa: F841 (documents the group layout)
+        kk = q.shape[1] // s.shape[1]    # noqa: F841 (documents the group layout)
         qsz = torch.stack([s, mn + 8.0 * s], -1).bfloat16().transpose(0, 1).contiguous()
         return packed, qsz
     return pack_fast(q.to(dev), s.to(dev), mn.to(dev), kt)
-
 
 def _synthetic_state(base: dict, group=32, keep_v=True) -> tuple[dict, dict]:
     """RTN-pack every projection except v_proj (bf16 keep), like w1."""
@@ -238,14 +189,11 @@ def _synthetic_state(base: dict, group=32, keep_v=True) -> tuple[dict, dict]:
     return state, {"group_size_map": gmap, "bf16_linears": keep,
                    "bf16_layers": []}
 
-
 def _write_state(path: str, state: dict, meta: dict) -> None:
     torch.save(state, path)
     with open(path + ".meta.json", "w") as f:
         json.dump(meta, f)
 
-
-# ------------------------------------------------------------------------ E1
 def phase_e1_writer_roundtrip() -> bool:
     print("E1 writer/reader round-trip (all dtypes, metadata, 3-D payload)")
     tmp = tempfile.mkdtemp(prefix="export_e1_")
@@ -279,15 +227,13 @@ def phase_e1_writer_roundtrip() -> bool:
                     and torch.equal(r.view(torch.uint8), t.contiguous().view(torch.uint8)))
             print(f"  {name:12s} {str(t.dtype):14s} {tuple(t.shape)} bytes-equal={same}")
             ok &= same
-        # metadata must not leak into the tensor namespace
+
         ok &= "__metadata__" not in back
         print(f"  E1: {'PASS' if ok else 'FAIL'}")
         return bool(ok)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-
-# ------------------------------------------------------------------------ E2
 def phase_e2_export_roundtrip() -> bool:
     print("E2 export end-to-end on a synthetic checkpoint")
     tmp = tempfile.mkdtemp(prefix="export_e2_")
@@ -318,7 +264,7 @@ def phase_e2_export_roundtrip() -> bool:
         print(f"  meta: preset={emeta['preset_name']} tensors={emeta['n_tensors']} "
               f"bf16_keeps={len(p['bf16_linears'])} "
               f"quantized={p['n_quantized_linears']}")
-        # re-read and verify every payload
+
         rmeta, weights, rstate, gmap, keep = read_standalone(out)
         n_q = n_bad = 0
         for li in sorted(state):
@@ -352,12 +298,8 @@ def phase_e2_export_roundtrip() -> bool:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-
-# ------------------------------------------------------------------------ E3
 def phase_e3_patch_path_equivalence() -> bool:
-    """The export must be *the same bytes* the patch path uses, and they must
-    still be the bytes an independent re-quantization of the base produces
-    (proves the flatten/rename step is value preserving and lossless)."""
+    """The export must be *the same bytes* the patch path uses, and they must still be the bytes an independent re-quantizat..."""
     print("E3 equivalence with the patch path (byte-level)")
     tmp = tempfile.mkdtemp(prefix="export_e3_")
     try:
@@ -377,17 +319,17 @@ def phase_e3_patch_path_equivalence() -> bool:
             for proj in sorted(patch[li]):
                 a, b = patch[li][proj], sstate[li][proj]
                 g = sgmap[(li, proj)]
-                # 1) patch-state vs standalone bytes
+
                 ok &= torch.equal(a["packed"], b["packed"])
                 ok &= torch.equal(a["qsz"], b["qsz"])
-                # 2) standalone vs an independent re-quantization of the base
+
                 key = f"language_model.layers.{li}.{_SRC[proj]}.weight"
                 q, s, mn = rtn_quantize(base[key], g)
                 packed, qsz = _pack(q, s, mn, 8, dev)
                 ok &= torch.equal(b["packed"], packed.cpu())
                 ok &= torch.equal(b["qsz"], qsz.cpu())
                 n += 1
-        # 3) bf16 keeps are the untouched base tensors
+
         for li, proj in skeep:
             key = f"language_model.layers.{li}.{_SRC[proj]}.weight"
             ok &= torch.equal(sweights[key], base[key])
@@ -399,8 +341,6 @@ def phase_e3_patch_path_equivalence() -> bool:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-
-# ------------------------------------------------------------------------ E4
 def phase_e4_loader_guards() -> bool:
     print("E4 loader guards")
     tmp = tempfile.mkdtemp(prefix="export_e4_")
@@ -415,13 +355,13 @@ def phase_e4_loader_guards() -> bool:
         ok = is_standalone_dir(out) and not is_standalone_dir(tmp)
         ok &= not is_standalone_dir(os.path.join(tmp, "base"))
         ok &= standalone_presets(out) == ["w1"]
-        # preset mismatch
+
         try:
             read_standalone(out, expected_preset="w2")
             ok = False
         except SystemExit:
             pass
-        # missing weight file
+
         moved = os.path.join(tmp, "quantized.moved")
         os.rename(os.path.join(out, Q_FILE), moved)
         try:
@@ -430,9 +370,7 @@ def phase_e4_loader_guards() -> bool:
         except FileNotFoundError:
             pass
         os.rename(moved, os.path.join(out, Q_FILE))
-        # incomplete record (drop one .qsz) -> must refuse.  Truncating the
-        # mapped file in place is not allowed, so rewrite it and repoint
-        # meta.json at the rewritten name.
+
         raw = read_safetensors(os.path.join(out, Q_FILE))
         trimmed = {k: v for k, v in raw.items() if k != "layers.0.q.qsz"}
         write_safetensors(os.path.join(out, "trimmed.safetensors"),
@@ -448,7 +386,7 @@ def phase_e4_loader_guards() -> bool:
             ok = False
         except ValueError as e:
             ok &= "incomplete" in str(e)
-        # state record keys are the ones GptqMossTTS._quantize reads
+
         out2 = os.path.join(tmp, "export2")
         export_standalone(os.path.join(tmp, "base"), spath, out2, "w1",
                           hash_base=False, quiet=True)
@@ -462,8 +400,6 @@ def phase_e4_loader_guards() -> bool:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-
-# ------------------------------------------------------------------------ E5
 _M5_META = {
     "created_utc": "2025-09-11T00:00:00Z",
     "n_tensors": 679,
@@ -475,13 +411,10 @@ _M5_META = {
          "sha256": "cd" * 32}]},
     "base_repo": "OpenMOSS-Team/MOSS-TTS-v1.5",
     "tool": {"torch": "2.9.1"},
-    # `export_standalone` always records the offline GPTQ state it exported
-    # from; the card's provenance section names it (and its sha256), so the
-    # fixture carries it too.
+
     "state": {"source_file": "w1.pt", "source_bytes": 4246863871,
               "sha256": "ef" * 32},
 }
-
 
 def phase_e5_model_card() -> bool:
     print("E5 model card rendering")
@@ -500,23 +433,21 @@ def phase_e5_model_card() -> bool:
         ok &= f"{PRESET_METRICS[preset]['gate2_audio_top25_pct']:.2f}" in card
         ok &= f"{PRESET_METRICS[preset]['steps_per_s_steady']:.1f}" in card
         ok &= "Apache-2.0" in card
-        ok &= "跨语言验证" in card   # langcheck-1 section survives every re-export
-        # A preset whose metrics carry no tie-robust measurement must render the
-        # single historical gate row instead of `n/a` tie rows/prose.
+        ok &= "跨语言验证" in card
+
         ok &= "n/a" not in card
-        # provenance: the card must name the state file it was exported from
+
         ok &= "`w1.pt`" in card and "ef" * 16 in card
         print(f"  {preset}: {len(card)} chars, no leftover placeholder, "
               f"metrics + cross-language section present, no n/a, "
               f"state file named")
-    # naming-drift guard: an unknown placeholder must raise
+
     try:
         render_model_card("{{NOT_A_PLACEHOLDER}}", meta, preset)
         ok = False
     except ValueError:
         pass
-    # the tie-robust branch (w2's real metric set) must expand the two-convention
-    # rows and the §3.1 convention note, and keep the cross-language section
+
     meta_tie = dict(_M5_META)
     meta_tie["presets"] = {"w2": {
         "label": PRESET_METRICS["w2"]["label"], "group_size_default": 32,
@@ -535,8 +466,6 @@ def phase_e5_model_card() -> bool:
     print(f"  E5: {'PASS' if ok else 'FAIL'}")
     return bool(ok)
 
-
-# ------------------------------------------------------------------------ E6
 def phase_e6_purity() -> bool:
     print("E6 export.py dependency purity")
     import ast
@@ -553,13 +482,12 @@ def phase_e6_purity() -> bool:
     extra = sorted(mods - allowed)
     top = sorted(mods)
     ok = not extra
-    # the dependency gate allows no `safetensors` package: the writer is ours
+
     ok &= "safetensors" not in mods
     print(f"  top-level imports: {top}")
     print(f"  disallowed: {extra}")
     print(f"  E6: {'PASS' if ok else 'FAIL'}")
     return bool(ok)
-
 
 def main_export() -> int:
     results = {
@@ -576,47 +504,17 @@ def main_export() -> int:
           + f" -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_vram_budget.py ----
-# ------------------------------------------------------------------------- #
-
-
-#: The 8 GB target is a *standalone* export: `base + w1p.pt` transiently
-#: materializes the 16.6 GiB bf16 base to assemble the model (`_load_tts` ->
-#: `MossTTSModel.__init__` copies every projection), which no 8 GB card can do
-#: regardless of the KV cache.  The deployment path for a small card is the
-#: self-contained directory (7.2 GiB on disk), where the int4 payload is
-#: installed directly.  This test therefore measures BOTH, and the 8 GB
-#: assertions apply to the standalone path.
 STANDALONE = os.environ.get("MOSS_TTS_8GB_DIR",
     "/root/MOSS-TTS/models_export/MOSS-TTS-v1.5-W4GPTQ-w1")
 
+_PEAK_GIB = 7.90
+_PEAK_CODEC_GIB = 3.80
+_PEAK_BASE_GIB = 8.45
 
-#: measured torch peaks on A10G-24G (kvfit-1 §2/§4).  Deliberately loose
-#: ceilings: a regression gate, not a benchmark -- the allocator's reservation
-#: behaviour moves between torch builds.
-_PEAK_GIB = 7.90          # standalone w1p, fast path, on-demand KV, budget 4096
-_PEAK_CODEC_GIB = 3.80    # MossCodecDecoder alone (measured 3.56)
-_PEAK_BASE_GIB = 8.45     # base + w1p.pt (the heavier assembly path), measured 8.33
-
-#: 8 GB simulation.  A `set_per_process_memory_fraction` budget is enforced by
-#: torch's caching allocator, which counts *reserved* bytes; the CUDA context
-#: (~0.29 GiB on A10G) lives outside it and is spent first.  So the faithful
-#: simulation of an 8 GiB card is `fraction = (8.0 - context) / total`, and the
-#: pass criterion is the *nvidia-smi* process peak (context + pool + tensors)
-#: staying under 8.0 GiB.  Sizing the fraction as `7.5/24` instead would charge
-#: the context inside the 7.5 and be stricter than any real 8 GiB card --
-#: measured, w1p's weights alone (7.115) + context (0.285) = 7.40 > 7.36, so
-#: that variant OOMs on the load itself, before any KV is allocated.
 EIGHT_GB_CARD = 8.0
 
-#: typical CLI inputs.  `budget` is the step budget each case is run with.
-#: The primary budget is 4096 (the CLI default) but see `_PEAK_BUDGET`: at an
-#: 8 GB *torch* cap the w1p tier only fits 2048 steps, so the 24 GiB peak gate
-#: uses 4096 and the 8 GB gate uses the largest budget that tier actually fits.
 CASES = [
-    # name, text, language, budget
+
     ("zh12", "你好，欢迎收听这段试音。", None, MAXNEW),
     ("en", "Hello, this is a short test of the text to speech system.",
      "English", MAXNEW),
@@ -629,27 +527,10 @@ CASES = [
      None, MAXNEW),
 ]
 
-#: measured 8 GB boundary (kvfit-1 §4): on a simulated 8.0 GiB card the w1p
-#: weights (7.12 GiB) + context (0.29) + pool (0.08) leave room for about 2048
-#: steps of KV; 2560 already exceeds the card.  The 8 GB phase therefore runs
-#: every case at this budget, which still covers ~164 s of audio.
 EIGHT_GB_BUDGET = 2048
 
-
 def _smi_total_mib() -> int:
-    """Total nvidia-smi footprint of EVERY process on the device.
-
-    `--query-compute-apps` reports host-namespace pids, which do not match
-    `os.getpid()` inside this container, so a pid filter silently matches nothing
-    (measured: nvidia-smi reported pid 768993 for a process whose `os.getpid()`
-    was 217835, and such a filter returned 0 for a live 0.5 GiB context).
-    Attribution is done by baseline subtraction instead: measure this before
-    creating a CUDA context, subtract it from the peak, and what is left is this
-    process's own context + tensors + graph pool.  That also correctly excludes a
-    parent's still-resident context when phase 2 runs in child processes, which a
-    raw sum gets wrong (it inflated the measured context from 0.285 to
-    0.840 GiB and produced a false FAIL).
-    """
+    """Total nvidia-smi footprint of EVERY process on the device."""
     import subprocess
     out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
                           "--format=csv,noheader"],
@@ -660,23 +541,14 @@ def _smi_total_mib() -> int:
             total += int(line.split(",")[1].strip().split()[0])
     return total
 
-
-#: nvidia-smi total at process start, before this process had a CUDA context
 _SMI_BASELINE_MIB = 0
-
 
 def _smi_mib() -> int:
     """This process's own nvidia-smi footprint (includes the graph pool)."""
     return _smi_total_mib() - _SMI_BASELINE_MIB
 
-
 def _start_ctx_gib() -> float:
-    """Create the CUDA context and return its cost in GiB.
-
-    The baseline is taken *before* `torch.cuda.init()`, so the number is this
-    process's own context -- not a neighbour's and not a parent's (see
-    `_smi_total_mib`).
-    """
+    """Create the CUDA context and return its cost in GiB."""
     global _SMI_BASELINE_MIB
     _SMI_BASELINE_MIB = _smi_total_mib()
     torch.cuda.init()
@@ -686,14 +558,12 @@ def _start_ctx_gib() -> float:
     torch.cuda.empty_cache()
     return (_smi_total_mib() - _SMI_BASELINE_MIB) / 1024
 
-
-# --------------------------------------------------------------- phase 0
 def phase_0_sizing() -> bool:
     """The on-demand size arithmetic, over the combination matrix."""
     print("=== Phase 0: KV-size derivation (unit, no GPU) ===")
     ok = True
     rows = [
-        # (requested floor, L0, max_new_tokens, expected, what it covers)
+
         (None, 66, 4096, 66 + 4096 + 64, "CLI default, short zh"),
         (None, 143, 4096, 143 + 4096 + 64, "CLI default, long zh"),
         (None, 71, 4096, 71 + 4096 + 64, "CLI default, en"),
@@ -712,17 +582,16 @@ def phase_0_sizing() -> bool:
         ok &= good
         print(f"  floor={str(requested):6s} L0={l0:4d} max_new={mnt:5d} -> "
               f"{got:6d} (want {want:6d}) {'ok' if good else 'FAIL'}  # {why}")
-    # the ramp margin must actually cover the delay FSM's tail
+
     n_vq = 32
     print(f"  KV_RAMP_MARGIN={KV_RAMP_MARGIN} >= n_vq(={n_vq}) + audio_end rows: "
           f"{KV_RAMP_MARGIN >= n_vq + 2}")
     ok &= KV_RAMP_MARGIN >= n_vq + 2
-    # default library size is the old hard-coded one, so library callers do not
-    # silently change behaviour
+
     print(f"  library default (synthesize/MossTTSModel) stays {DEFAULT_MAX_SEQ_LEN}: "
           f"{DEFAULT_MAX_SEQ_LEN == 8192}")
     ok &= DEFAULT_MAX_SEQ_LEN == 8192
-    # MiB arithmetic: 36 layers x 2 (K,V) x 8 kv heads x 128 head_dim x bf16
+
     for n, want in ((8192, 1152.0), (1024, 144.0)):
         got = _kv_mib(n)
         good = abs(got - want) < 1e-6
@@ -730,7 +599,6 @@ def phase_0_sizing() -> bool:
         print(f"  _kv_mib({n}) = {got:.1f} MiB (want {want:.1f}) "
               f"{'ok' if good else 'FAIL'}")
 
-    # ---- resize identity: an on-demand table is a prefix of a big one -------
     w = _tiny_weights()
     m_small = MossTTSModel(w, device="cpu", dtype=torch.bfloat16, max_seq_len=300)
     m_big = MossTTSModel(w, device="cpu", dtype=torch.bfloat16, max_seq_len=8192)
@@ -741,9 +609,9 @@ def phase_0_sizing() -> bool:
     grow_ok = bool(torch.equal(m_grow.rope_cos, m_big.rope_cos)
                    and torch.equal(m_grow.rope_sin, m_big.rope_sin)
                    and m_grow.k_cache.shape == m_big.k_cache.shape)
-    # a no-op resize must not move anything
+
     noop_ok = m_grow.ensure_seq_len(1024) == 8192
-    # growth must preserve live KV and zero only the tail
+
     m_grow.reset()
     m_grow._seq = 4
     m_grow.k_cache[:, :, :4] = 7.0
@@ -761,9 +629,8 @@ def phase_0_sizing() -> bool:
     print(f"  phase 0 gate: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
 def _tiny_weights() -> dict:
-    """Minimal weights dict: shapes are all MossTTSModel.__init__ inspects."""
+    """Minimal weights dict:"""
     return {
         "language_model.embed_tokens.weight": torch.zeros(155648, 4096),
         "language_model.norm.weight": torch.zeros(4096),
@@ -783,15 +650,8 @@ def _tiny_weights() -> dict:
         **{f"emb_ext.{i}.weight": torch.zeros(1025, 4096) for i in range(32)},
     }
 
-
-# --------------------------------------------------------------- phase 1
 def _fresh(max_seq_len: int):
-    """Standalone w1p export -> (model, fast) at an explicit cache size.
-
-    The standalone directory is preferred because it is the 8 GB deployment
-    shape; if it is absent the base+state path is used (the same module, just
-    assembled the slow way) so the peak gate still runs.
-    """
+    """Standalone w1p export -> (model, fast) at an explicit cache size."""
     if os.path.isdir(STANDALONE):
         from moss_tts_lite.export import load_standalone_model
         return load_standalone_model(STANDALONE, device="cuda",
@@ -805,11 +665,10 @@ def _fresh(max_seq_len: int):
     torch.cuda.empty_cache()
     return model, fast
 
-
 def phase_1_peaks() -> bool:
     """Measured peaks for typical inputs at the on-demand cache size."""
     print("=== Phase 1: measured peaks (on-demand KV, w1p fast path) ===")
-    _start_ctx_gib()          # take the nvidia-smi baseline before anything else
+    _start_ctx_gib()
     os.makedirs(OUT, exist_ok=True)
     ok = True
     worst = 0.0
@@ -837,7 +696,7 @@ def phase_1_peaks() -> bool:
             del fast, model
             gc.collect()
             torch.cuda.empty_cache()
-    # the on-demand cache must be a real saving against the old fixed 8192
+
     model, fast = _fresh(DEFAULT_MAX_SEQ_LEN)
     prompt = build_tts_prompt(CASES[0][1])
     torch.cuda.reset_peak_memory_stats()
@@ -847,7 +706,7 @@ def phase_1_peaks() -> bool:
     gc.collect()
     torch.cuda.empty_cache()
     saved = peak_8192 - worst
-    # the KV saving itself is arithmetic and must be exactly the table's number
+
     kv_saved_mib = _kv_mib(8192) - _kv_mib(_resolve_max_seq_len(None, 66, MAXNEW))
     good = saved > 0.4 and abs(kv_saved_mib - 558) < 2
     ok &= good
@@ -855,7 +714,6 @@ def phase_1_peaks() -> bool:
           f"({kv_saved_mib:.0f} MiB of KV) {'ok' if good else 'FAIL'}")
     print(f"  phase 1 gate: {'PASS' if ok else 'FAIL'} (worst {worst:.3f} GiB)")
     return ok
-
 
 def _phase2_one(case: str) -> dict:
     """One 8 GB case, in its own process (see `_phase2_child` for why)."""
@@ -879,19 +737,8 @@ def _phase2_one(case: str) -> dict:
         rec["err"] = "OOM"
     return rec
 
-
 def _phase2_child() -> bool:
-    """Run phase 2 in fresh processes and return the verdict.
-
-    This is not a convenience: the caching allocator cannot fully return what it
-    reserved under a `set_per_process_memory_fraction` cap, so a phase 2 that ran
-    after phase 1's several model loads -- or even several cases back to back --
-    OOMs at a cap that passes standalone (measured: the second case onward fails
-    at the correct 7.715 GiB cap, while each case in its own process passes).
-    That is the same cross-iteration poisoning the report's `run_grid.sh` avoids
-    with one process per arm.  A fresh CUDA context + allocator is the only way
-    to measure a card-size budget honestly.
-    """
+    """Run phase 2 in fresh processes and return the verdict."""
     import subprocess
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ok = True
@@ -921,8 +768,6 @@ def _phase2_child() -> bool:
           f"{EIGHT_GB_CARD - (ctx or 0):.3f} GiB; pass criterion: "
           f"nvidia-smi peak <= {EIGHT_GB_CARD} GiB")
 
-    # the codec phase (TTS freed) + the boundary control + the advice checks:
-    # one more child each, for the same allocator reason
     for label, env in (("codec", "KVFIT_C1=c"), ("boundary", "KVFIT_C1=b"),
                        ("advice", "KVFIT_C1=a")):
         proc = subprocess.run([sys.executable, "-m", "tests.test_release"],
@@ -934,7 +779,6 @@ def _phase2_child() -> bool:
         print("  " + (out[0][len("KVFITC1 "):] if out else f"{label} child failed"))
     print(f"  phase 2 gate: {'PASS' if ok else 'FAIL'}")
     return ok
-
 
 def _phase2_rest(which: str) -> bool:
     """Codec / boundary-control / advice checks, each in its own capped process."""
@@ -955,13 +799,7 @@ def _phase2_rest(which: str) -> bool:
         print(f"KVFITC1 codec alone: peak={peak:.3f} GiB (ceiling {_PEAK_CODEC_GIB}, "
               f"cap {cap:.3f}) -> {'PASS' if ok else 'FAIL'}")
     elif which == "b":
-        # A budget well above the fit: 4 x 2048 = 8192 is robustly over an 8 GiB
-        # card for this tier (the CLI default of 4096 is over too, and is covered
-        # by the sweep in the report).  The control is deliberately NOT 2560: that
-        # sits 14 MiB above the card in the report's sweep and flips with
-        # allocator fragmentation, so asserting it would make this gate flaky.
-        # The claim being pinned here is a yes/no one -- a budget far above what
-        # the card can hold must OOM, and `--max-new-tokens 2048` must not.
+
         over = 4 * EIGHT_GB_BUDGET
         prompt = build_tts_prompt(CASES[0][1])
         l0 = int(prompt["input_ids"].shape[1])
@@ -1003,7 +841,6 @@ def _phase2_rest(which: str) -> bool:
               f"passes through={passthrough} -> {'PASS' if ok else 'FAIL'}")
     return ok
 
-
 def main_vram_budget() -> int:
     if os.environ.get("KVFIT_PHASE2"):
         import json
@@ -1028,15 +865,9 @@ def main_vram_budget() -> int:
           f"8gb={('PASS' if ok2 else 'FAIL')} -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
-
-# --------------------------------------------------------------------------- #
-# Unified entry point: each source file's own entry function, in order.
-# --------------------------------------------------------------------------- #
-
 def main() -> int:
     rc = 0
-    # Child-process dispatch used by the VRAM phase 2: those children need a
-    # fresh CUDA context + allocator, so they must run only that entry point.
+
     if os.environ.get("KVFIT_PHASE2") or os.environ.get("KVFIT_C1"):
         return main_vram_budget()
     rc |= main_dep_purity() or 0
@@ -1044,7 +875,6 @@ def main() -> int:
     rc |= main_vram_budget() or 0
 
     return rc
-
 
 if __name__ == "__main__":
     sys.exit(main())

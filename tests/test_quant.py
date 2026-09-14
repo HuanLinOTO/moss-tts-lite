@@ -1,25 +1,10 @@
-"""Quantization tests: GPTQ W4 core + the fast W4 tier.
-
-G1..G9 cover the int4 pack format, CUDA kernel semantics, the GPTQ
-objective/laziness, GptqMossTTS injection, mixed-precision dispatch
-and kernel-supported group sizes; then the M4 W4 fast-path gates.
-GPU, under the lock (the int4pack kernel is CUDA-only).
-
-Consolidated from:
-  test_gptq.py
-  test_fast_m4.py
-
-Run:
-  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_quant.py
-"""
+"""Quantization tests:"""
 
 from __future__ import annotations
 
 import os
 import sys
 
-# `python3 tests/<this file>.py` straight from the repo root must import
-# moss_tts_lite without an explicit PYTHONPATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from types import SimpleNamespace
@@ -40,14 +25,9 @@ from moss_tts_lite.model import (AUDIO_PAD_CODE, N_VQ, MossTTSModel, _rms_norm,
 
 try:
     from moss_tts_lite.st_loader import read_safetensors
-except ImportError:  # pragma: no cover
+except ImportError:
     from tests._mini_loader import read_safetensors_min as read_safetensors
 
-# --------------------------------------------------------------------------- #
-# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
-# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
-# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
-# --------------------------------------------------------------------------- #
 ROOT = os.environ.get("MOSS_TTS_ROOT",
                       os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
@@ -55,42 +35,27 @@ CODEC_DIR = os.path.join(ROOT, "models", "MOSS-Audio-Tokenizer")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 OUT = os.path.join(ROOT, ".tmp", "perf_agent")
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_gptq.py ----
-# ------------------------------------------------------------------------- #
-
 DEV = torch.device("cuda")
 G = 128
-
 
 def _rand_weight(n, k, scale=0.05, seed=0):
     gen = torch.Generator(device="cpu").manual_seed(seed)
     w = torch.randn(n, k, generator=gen) * scale
-    # group-structured magnitude modulation (mimics real weight blocks)
+
     w = w * (1.0 + 0.5 * torch.sin(torch.arange(k, dtype=torch.float32) / 97.0))
     return w.to(torch.bfloat16).to(DEV)
 
-
 def _check_int4pack_shapes(m) -> None:
-    """`_convert_weight_to_int4pack(inner_k_tiles=8)` requires K/2 % 128 == 0
-    (i.e. K % 256 == 0).  A smaller K is silently packed into a short tensor and
-    every later kernel comparison becomes self-consistently meaningless."""
+    """`_convert_weight_to_int4pack(inner_k_tiles=8)` requires K/2 % 128 == 0 (i."""
     for li, lyr in enumerate(m.layers):
         for name in _LIN_NAMES:
             k, n = int(lyr[name].shape[1]), int(lyr[name].shape[0])
             assert k % 256 == 0, f"L{li} {name}: K={k} invalid for int4pack"
             assert n % 8 == 0, f"L{li} {name}: N={n} invalid for int4pack"
 
-
 def _fake_backbone(n_layers=2, hidden=256, n_heads=8, head_dim=32,
                    text_vocab=64, seed=0):
-    """Synthetic `MossTTSModel` skeleton: only the attributes FastMossTTS,
-    `_quantize` and `_linear` touch.  Layer dicts hold the 7 bf16 linears.
-
-    Default widths are valid for the int4pack kernel (K % 256 == 0), so tests
-    that call the kernel actually exercise it.
-    """
+    """Synthetic `MossTTSModel` skeleton:"""
     shapes = {"q": (n_heads * head_dim, hidden), "k": (2 * head_dim, hidden),
               "v": (2 * head_dim, hidden), "o": (hidden, n_heads * head_dim),
               "gate": (hidden * 2, hidden), "up": (hidden * 2, hidden),
@@ -105,14 +70,12 @@ def _fake_backbone(n_layers=2, hidden=256, n_heads=8, head_dim=32,
     _check_int4pack_shapes(m)
     return m
 
-
-# ---------------------------------------------------------------- phase G1 ---
 def phase_g1_format_parity():
     print("=== G1: bit-level format parity with FastMossTTS._quantize ===")
     ok = True
     for li, seed in enumerate((11, 12, 13)):
         m = _fake_backbone(n_layers=1, seed=seed)
-        # reference: fast.py's own quantizer (its RTN branch), on the same weights
+
         fast = FastMossTTS(m, quant="w4", w4_group_size=G)
         m2 = _fake_backbone(n_layers=1, seed=seed)
         for name in _LIN_NAMES:
@@ -130,8 +93,6 @@ def phase_g1_format_parity():
     print(f"  G1: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# ---------------------------------------------------------------- phase G2 ---
 def phase_g2_kernel_semantics():
     print("=== G2: kernel output vs reference dequantization ===")
     torch.manual_seed(0)
@@ -140,12 +101,12 @@ def phase_g2_kernel_semantics():
         w = _rand_weight(n, k, seed=n)
         q, s, mn = rtn_quantize(w, G)
         packed, qsz = pack_fast(q, s, mn, 8)
-        w_eff = effective_weight(q, qsz, G)                       # [N,K] fp32
+        w_eff = effective_weight(q, qsz, G)
         km, x = 8, torch.randn(8, k, dtype=torch.bfloat16, device=DEV)
         y = torch._weight_int4pack_mm(x, packed, G, qsz)
         y_ref = (x.float() @ w_eff.t())
         rel = ((y.float() - y_ref).norm() / y_ref.norm()).item()
-        # dequantized weights must equal the stored affine form exactly
+
         scale = qsz[:, :, 0].t().float().reshape(n, k // G, 1)
         zero = qsz[:, :, 1].t().float().reshape(n, k // G, 1)
         d2 = ((q.float().reshape(n, k // G, G) - 8.0) * scale + zero).reshape(n, k)
@@ -157,22 +118,18 @@ def phase_g2_kernel_semantics():
     print(f"  G2: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# ---------------------------------------------------------------- phase G3 ---
 def _correlated_activations(n_tok, k, seed=0, device=DEV):
     gen = torch.Generator(device="cpu").manual_seed(seed)
     base = torch.randn(n_tok, k, generator=gen)
-    # low-rank + scale structure so H is realistic (not identity)
+
     mix = torch.randn(k, 64, generator=gen) / 8.0
     x = base + base @ mix @ mix.t()
     x = x * torch.exp(torch.linspace(0, 1.2, k)).unsqueeze(0)
     return x.float().to(device)
 
-
 def _objective(w_orig, w_hat, H):
     d = (w_hat - w_orig.float())
     return float((d @ H @ d.t()).diagonal().sum().item())
-
 
 def phase_g3_core():
     print("=== G3: GPTQ core (objective, block-laziness, code sanity) ===")
@@ -194,20 +151,17 @@ def phase_g3_core():
           f"ratio={obj_q / obj_rtn:.3f}")
     ok = ok and obj_q < obj_rtn * 0.9
 
-    # (b) slot_errors == direct output-MSE computation
     errs = slot_errors({"cal": x}, w, w_q)
     direct = float(((x @ (w_q - w.float()).t()) ** 2).mean().item())
     print(f"  slot_errors mse={errs['cal']['mse']:.6e}  direct={direct:.6e}  "
           f"rel={errs['cal']['rel']:.3e}")
     ok = ok and abs(errs["cal"]["mse"] - direct) <= 1e-9 + 1e-6 * abs(direct)
 
-    # (c) code range + group stats bound
     assert res.q.min().item() >= 0 and res.q.max().item() <= 15
     print(f"  codes in [{int(res.q.min())},{int(res.q.max())}] "
           f"dtype={res.q.dtype} packed_dtype={res.packed.dtype} "
           f"qsz{tuple(res.qsz.shape)}/{res.qsz.dtype}")
 
-    # (d) lazy block update == non-lazy (block_size == K) column GPTQ
     res_flat = gptq_quantize(w, H, group_size=G, block_size=k, damp_percent=0.01,
                              scale_from="original")
     res_block = gptq_quantize(w, H, group_size=G, block_size=G, damp_percent=0.01,
@@ -218,8 +172,6 @@ def phase_g3_core():
           f" ({frac:.2e})  [fp32 summation-order only]")
     ok = ok and frac <= 1e-3
 
-    # (e) compensating must not be worse than RTN on the *reported* metric and
-    #     'original' vs 'compensated' scaling both work
     res_o = gptq_quantize(w, H, group_size=G, block_size=G, damp_percent=0.01,
                           scale_from="original")
     for tag, r in (("compensated", res), ("original", res_o)):
@@ -229,12 +181,10 @@ def phase_g3_core():
     print(f"  G3: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# ---------------------------------------------------------------- phase G4 ---
 def phase_g4_injection():
     print("=== G4: GptqMossTTS injection (incl. mixed-precision branch) ===")
     m = _fake_backbone(n_layers=2, seed=21)
-    # RTN state built with *this* module's packer, then consumed by the subclass
+
     state = {}
     keep = {1}
     for li in range(m.n_layers):
@@ -264,14 +214,14 @@ def phase_g4_injection():
             if not same:
                 print(f"  L{li} {name}: MISMATCH vs FastMossTTS(quant='w4')")
     print(f"  qlayers identical to FastMossTTS(quant='w4'): {ok}")
-    # _linear dispatch: quantized layers == kernel on packed, bf16 layer == F.linear
+
     x = torch.randn(3, m.hidden_size, dtype=torch.bfloat16, device=DEV)
     y_keep = fast._linear(x, 1, "q")
     y_ref = F.linear(x, w_keep)
     eq_bf16 = torch.equal(y_keep, y_ref)
     print(f"  bf16_keep layer path == F.linear: {eq_bf16}")
     ok = ok and eq_bf16
-    # quantized path must reproduce the kernel call on the stored packed form
+
     p_my, q_my = fast.qlayers[0]["q"]
     y_kernel = torch._weight_int4pack_mm(x, p_my, G, q_my)
     y_lin = fast._linear(x, 0, "q")
@@ -281,8 +231,6 @@ def phase_g4_injection():
     print(f"  G4: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# ---------------------------------------------------------------- phase G5 ---
 def phase_g5_purity():
     print("=== G5: gptq.py dependency purity ===")
     import ast
@@ -304,18 +252,15 @@ def phase_g5_purity():
     print(f"  G5: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# ---------------------------------------------------------------- phase G7 ---
 def phase_g7_shared_hinv():
-    """The shared (slot-level) inverse and the CPU-factorisation path must give
-    bitwise-identical codes to the per-linear GPU inverse."""
+    """The shared (slot-level) inverse and the CPU-factorisation path must give bitwise-identical codes to the per-linear GP..."""
     print("=== G7: shared Hinv + inverse_device equivalence ===")
     n, k, n_tok = 192, 512, 700
     x = _correlated_activations(n_tok, k, seed=17)
     H = x.t() @ x
     w = _rand_weight(n, k, scale=0.08, seed=23)
     ok = True
-    # (a) CPU factorisation agrees with the GPU one to fp32 roundoff
+
     h_gpu, d_gpu = damped_cholesky_inverse(H, 0.01)
     h_cpu, d_cpu = damped_cholesky_inverse(H.to("cpu"), 0.01,
                                            work_device="cpu")
@@ -325,8 +270,7 @@ def phase_g7_shared_hinv():
     print(f"  CPU vs GPU inverse: rel|d|={rel:.3e} (max|d|={dmax:.3e}, "
           f"damp {d_gpu:.4e}/{d_cpu:.4e}) — LAPACK vs cuSOLVER roundoff")
     ok = ok and rel < 1e-5
-    # (b) the refactored shared-inverse path is bitwise identical to the
-    #     original per-linear inverse (same H -> same Hinv -> same codes)
+
     r_ref = gptq_quantize(w, H, group_size=G, block_size=G)
     r_shr = gptq_quantize(w, group_size=G, block_size=G, Hinv=h_gpu.clone())
     q_same = torch.equal(r_shr.q, r_ref.q)
@@ -334,8 +278,7 @@ def phase_g7_shared_hinv():
     print(f"  shared-Hinv (GPU) == per-linear inverse: codes {q_same}, "
           f"qsz {sz_same}")
     ok = ok and q_same and sz_same
-    # (c) the CPU factorisation (production path for K=12288) must land on the
-    #     same objective within fp32 roundoff; a few boundary codes may flip
+
     r_cpu = gptq_quantize(w, group_size=G, block_size=G, Hinv=h_cpu)
     flip = int((r_cpu.q != r_ref.q).sum().item()) / r_ref.q.numel()
     o_ref = _objective(w, r_ref.dequant(), H)
@@ -344,7 +287,7 @@ def phase_g7_shared_hinv():
           f"objective {o_cpu:.6e} vs {o_ref:.6e} "
           f"(rel {abs(o_cpu - o_ref) / o_ref:.2e})")
     ok = ok and flip < 1e-3 and abs(o_cpu - o_ref) / o_ref < 1e-2
-    # (c) Cholesky inverse really is H^-1 (damped)
+
     eye = torch.eye(k, device=H.device)
     Hd = H + d_gpu * eye
     resid = (h_gpu.t() @ h_gpu @ Hd - eye).abs().max().item()
@@ -353,11 +296,9 @@ def phase_g7_shared_hinv():
     print(f"  G7: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# ---------------------------------------------------------------- phase G6 ---
 def _mini_weights(hidden=64, head_dim=16, n_heads=4, n_kv=2, inter=96,
                   vocab=151700, n_layers=2, seed=5):
-    """Synthetic checkpoint dict shaped like MOSS-TTS-v1.5 (tiny)."""
+    """Synthetic checkpoint dict shaped like MOSS-TTS-v1."""
     gen = torch.Generator().manual_seed(seed)
 
     def r(*shape, scale=0.2):
@@ -385,10 +326,8 @@ def _mini_weights(hidden=64, head_dim=16, n_heads=4, n_kv=2, inter=96,
         w[f"lm_heads.{i + 1}.weight"] = r(AUDIO_PAD_CODE + 1, hidden)
     return w
 
-
 def phase_g6_capture_tap():
-    """CapturingMossTTS must be numerics-identical to MossTTSModel, and the
-    captured slots must be the exact tensors the linears consume."""
+    """CapturingMossTTS must be numerics-identical to MossTTSModel, and the captured slots must be the exact tensors the lin..."""
     print("=== G6: CapturingMossTTS tap parity (CPU mini model) ===")
     w = _mini_weights()
     base = MossTTSModel(w, device="cpu", dtype=torch.bfloat16, max_seq_len=256)
@@ -403,8 +342,7 @@ def phase_g6_capture_tap():
         eq = torch.equal(hb, hc)
         print(f"  prefill bitwise equal: {eq}  layers tapped: {len(cap.cap_slots)}")
         ok = ok and eq
-        # every captured slot must be exactly the tensor its consumers read:
-        # recompute the layer from the tapped slots and compare (bitwise).
+
         h = cap._embed(ids)
         for li in range(cap.n_layers):
             prev = h
@@ -432,11 +370,8 @@ def phase_g6_capture_tap():
     print(f"  G6: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# ---------------------------------------------------------------- phase G8 ---
 def phase_g8_mixed_dispatch():
-    """Per-linear bf16 keep and per-linear group sizes must dispatch to exactly
-    the intended kernel/F.linear call (CUDA: the int4pack kernel is CUDA-only)."""
+    """Per-linear bf16 keep and per-linear group sizes must dispatch to exactly the intended kernel/F."""
     print("=== G8: mixed-precision / mixed-group dispatch ===")
     torch.manual_seed(0)
     m = _fake_backbone(n_layers=2, seed=31)
@@ -449,15 +384,15 @@ def phase_g8_mixed_dispatch():
                 q, sc, mn = rtn_quantize(m.layers[li][name], g)
                 packed, qsz = pack_fast(q, sc, mn, 8)
                 state[li].setdefault(name, {})[g] = (packed, qsz)
-    # layer 0: pack all linears at their chosen group; layer 1 too
-    keep = {(1, "down"), (1, "o")}          # per-projection bf16
+
+    keep = {(1, "down"), (1, "o")}
     gmap_pairs = {(0, "down"): 32, (1, "q"): 32}
     sel = {li: {name: gmap_pairs.get((li, name), 128) for name in _LIN_NAMES}
            for li in range(2)}
     base_state = {li: {n: {"packed": state[li][n][sel[li][n]][0],
                            "qsz": state[li][n][sel[li][n]][1]}
                        for n in _LIN_NAMES} for li in range(2)}
-    # snapshot the bf16 originals before the subclass pops them
+
     w_bf16 = {li: {n: m.layers[li][n].clone() for n in _LIN_NAMES}
               for li in range(2)}
     fast = GptqMossTTS(m, base_state, w4_group_size=128, bf16_keep=keep,
@@ -467,7 +402,7 @@ def phase_g8_mixed_dispatch():
           f"mixed_groups={ {f'{a}:{b}': g for (a, b), g in fast.mixed_groups().items()} }")
     for li in range(2):
         for name in _LIN_NAMES:
-            # each projection takes its own input width (down_proj is 2x hidden)
+
             x = torch.randn(5, int(w_bf16[li][name].shape[1]),
                             dtype=torch.bfloat16, device=DEV)
             y = fast._linear(x, li, name)
@@ -489,16 +424,8 @@ def phase_g8_mixed_dispatch():
     print(f"  G8: {'PASS' if ok else 'FAIL'}")
     return ok
 
-
-# ---------------------------------------------------------------- phase G9 ---
 def phase_g9_group_sizes():
-    """Which int4 group sizes does this build's kernel accept?
-
-    The deployment kernel fixes group_size at runtime (`w4_group_size`), so an
-    alternative group size is only usable if `_convert_weight_to_int4pack` +
-    `_weight_int4pack_mm` round-trip it.  Reported so the mixed-precision ladder
-    can pick a *supported* finer group (64 / 32) instead of guessing.
-    """
+    """Which int4 group sizes does this build's kernel accept? The deployment kernel fixes group_size at runtime (`w4_group_..."""
     print("=== G9: kernel-supported int4 group sizes ===")
     if not torch.cuda.is_available():
         print("  G9: SKIP (no CUDA)")
@@ -516,20 +443,18 @@ def phase_g9_group_sizes():
             q, s, mn = rtn_quantize(w, g)
             packed, qsz = pack_fast(q, s, mn, 8)
             y = torch._weight_int4pack_mm(x, packed, g, qsz)
-            # the kernel is exact affine arithmetic on the packed weights, so
-            # compare against the effective (dequantized) weight
+
             wq = effective_weight(q, qsz, g).to(torch.bfloat16)
             ref = F.linear(x, wq)
             rel = (y.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-9)
             ok_sizes.append(g)
             print(f"  g={g:4d}: OK  qsz{tuple(qsz.shape)} "
                   f"kernel-vs-dequant rel={rel.item():.2e}")
-        except Exception as e:                             # noqa: BLE001
+        except Exception as e:                               # noqa: BLE001
             print(f"  g={g:4d}: FAIL {type(e).__name__}: {str(e)[:70]}")
     print(f"  supported: {ok_sizes}")
     print("  G9: PASS" if ok_sizes else "  G9: FAIL")
     return bool(ok_sizes)
-
 
 def main_gptq() -> int:
     if not torch.cuda.is_available():
@@ -551,32 +476,25 @@ def main_gptq() -> int:
     print(f"test_gptq: {summary} -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
-
-# ------------------------------------------------------------------------- #
-# ---- from test_fast_m4.py ----
-# ------------------------------------------------------------------------- #
 try:
     from moss_tts_lite.st_loader import read_safetensors
-except ImportError:  # pragma: no cover
+except ImportError:
     from tests._mini_loader import read_safetensors_min as read_safetensors
-
 
 SEED = 1234
 SR = 24000
-AUDIO_FPS = 12.5  # codec frame rate: one step == one audio frame
-
+AUDIO_FPS = 12.5
 
 def _steps_ps(step_ms, skip=0):
     ms = step_ms[skip:]
     return 1000.0 / (sum(ms) / len(ms)) if ms else float("nan")
 
-
 def phase_a(fast, zh_ids):
-    """Teacher-forced 40 steps: quantized forward vs golden logits (M4 gates)."""
+    """Teacher-forced 40 steps:"""
     print("=== Phase A: teacher-forced 40-step (quantized forward, M4 gates) ===")
     z = np.load(os.path.join(GOLDEN, "logits_golden.npz"))
-    gt_text = torch.from_numpy(z["logits_text"]).cuda()          # [40, V]
-    gt_audio = torch.from_numpy(z["logits_audio"]).cuda()        # [40, 32, 1025]
+    gt_text = torch.from_numpy(z["logits_text"]).cuda()
+    gt_audio = torch.from_numpy(z["logits_audio"]).cuda()
     gt_rows = torch.from_numpy(z["selected_rows"]).reshape(-1, 33).cuda()
     model = fast.m
     mine_text, mine_audio = [], []
@@ -595,14 +513,13 @@ def phase_a(fast, zh_ids):
     mine_audio = torch.stack(mine_audio)[..., :1024]
     gt_a = gt_audio[..., :1024]
 
-    # --- text head: argmax gate ---
     ok_t = (mine_text.argmax(-1) == gt_text.argmax(-1)).float().mean().item() * 100
     d_t = (mine_text - gt_text).abs().max().item()
-    # --- audio heads: top-25 membership gate (golden top1 in mine top-25) ---
-    top25 = mine_audio.topk(25, dim=-1).indices              # [40, 32, 25]
-    gold1 = gt_a.argmax(-1).unsqueeze(-1)                    # [40, 32, 1]
+
+    top25 = mine_audio.topk(25, dim=-1).indices
+    gold1 = gt_a.argmax(-1).unsqueeze(-1)
     mem = (top25 == gold1).any(-1).float().mean().item() * 100
-    # --- audio heads: argmax agreement (report-only; tie-dominated) ---
+
     ok_a_all = (mine_audio.argmax(-1) == gold1.squeeze(-1)).float().mean().item() * 100
     top2g = gt_a.topk(2, dim=-1).values
     gap = top2g[..., 0] - top2g[..., 1]
@@ -624,7 +541,6 @@ def phase_a(fast, zh_ids):
     ok = ok_t >= 99.0
     return ok, ok_t, mem, ok_a_all, ok_a_nt, tie_share
 
-
 def _gen_wav(fast, ids, mask, out_path, label):
     model = fast.m
     res = generate_fast(fast, {"input_ids": ids.cuda(), "attention_mask": mask.cuda()},
@@ -645,7 +561,6 @@ def _gen_wav(fast, ids, mask, out_path, label):
     ok = res.finished and res.audio_frames.shape[0] > 0 and fin and dur > 1.0
     return ok, dur, res
 
-
 def main_fast_m4() -> int:
     assert torch.cuda.is_available()
     torch.cuda.reset_peak_memory_stats()
@@ -657,7 +572,7 @@ def main_fast_m4() -> int:
     model = MossTTSModel(weights, device=torch.device("cuda"),
                          dtype=torch.bfloat16, max_seq_len=8192)
     del weights
-    fast = FastMossTTS(model, quant="w4")   # shipped default tier: g128
+    fast = FastMossTTS(model, quant="w4")
     torch.cuda.empty_cache()
     g = fast.w4_group_size
     print(f"after W4(g{g}) quantize: "
@@ -692,12 +607,10 @@ def main_fast_m4() -> int:
           f"({sum(step_ms[10:]) / len(step_ms[10:]):.2f} ms/step)")
     vram = torch.cuda.max_memory_allocated() / 2**30
     print(f"VRAM peak (decode only): {vram:.2f} GiB")
-    # decode RTF: audio time produced / decode wall time (1 frame = 80 ms)
+
     rtf = (sum(step_ms[10:]) / 1000.0) / (len(step_ms[10:]) / AUDIO_FPS)
     print(f"decode RTF: {rtf:.3f} (audio seconds per decode second, steady)")
 
-    # Supervisor M4 decision: speed/VRAM are report-only; the shipped
-    # positioning is bf16-fast 36 steps/s (EXACT) vs W4 ~90 steps/s.
     ok_c = True
     ok = ok_a and ok_zh and ok_en and ok_c
     print(f"test_fast_m4: phaseA={'PASS' if ok_a else 'FAIL'} "
@@ -708,18 +621,12 @@ def main_fast_m4() -> int:
           f"-> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
-
-# --------------------------------------------------------------------------- #
-# Unified entry point: each source file's own entry function, in order.
-# --------------------------------------------------------------------------- #
-
 def main() -> int:
     rc = 0
     rc |= main_gptq() or 0
     rc |= main_fast_m4() or 0
 
     return rc
-
 
 if __name__ == "__main__":
     sys.exit(main())
