@@ -106,7 +106,7 @@ max_seq_len = L0 + --max-new-tokens + 64
 
 **数值路径零改动**：KV 尺寸只改缓冲区大小，不改任何算子。证明（同 seed 同文本，
 8192 与按需两种尺寸下逐位比较）：zh/en/pause/长文四种输入的 text 与 audio 全轨迹
-`torch.equal` = True，步数完全相同（`tests/test_vram_budget.py` Phase 0/1,
+`torch.equal` = True，步数完全相同（`tests/test_release.py` Phase 0/1,
 `.tmp/reports/kvfit-1.md` §5）。
 
 ## 路径对照表（A10G-24G / torch 2.9.1 实测；其他卡等比参考）
@@ -168,7 +168,7 @@ W4 档在极少数种子下会出现"非终止近静音"生成（verdict-1 §五
 段长地板 640 相对正常最长段 464 帧留 38% 余量，且规则 (b) 额外要求尾部已静音，
 因此**持续出声的健康长段永不误触发**。触发时强制收尾并置 `watchdog_triggered`，
 CLI 打印 `WARNING: production watchdog triggered`。回归见
-`python3 -m moss_tts_lite.tests.test_fast_watchdog`（四相：静音/段长/正例/持续发声）。
+`python3 tests/test_generation.py`（四相：静音/段长/正例/持续发声）。
 
 **GPTQ 档已不需要看门狗兜底**（0/12 失控），但看门狗默认保留作为所有档位的最后防线。
 
@@ -335,17 +335,21 @@ bf16 清单/基座 sha256）、分词器与 config 全套、模型卡 `README.md
 ## 复现测试（GPU；Linux 开发环境命令，Windows 下去掉 flock 部分）
 
 ```bash
-# M1：fast bf16 EXACT 门禁（phase0 bitwise + zh/en 全轨迹 EXACT + 速度）
+# 合并后的测试套件按类别分 8 个文件（详见 tests/test_*.py 的模块 docstring）。
+# M1 + fast-native：phase0 bitwise + zh/en 全轨迹 EXACT + 速度，
+#                  n1 逐位门禁 + n2 质量门 + 三个 bug 回归（见 native-1 报告）
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \
-    python3 -m moss_tts_lite.tests.test_fast
+    python3 tests/test_fast.py
 
-# M4：W4 套件（文本 argmax 硬门禁 + E2E wav + 速度/VRAM/RTF）
+# M4 + GPTQ：W4 套件（文本 argmax 硬门禁 + E2E wav + 速度/VRAM/RTF）
+#           + G1..G9 量化核心与 kernel 约定（见 perf-m4 报告）
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \
-    python3 -m moss_tts_lite.tests.test_fast_m4
+    python3 tests/test_quant.py
 
-# fast-native：n1 逐位门禁 + n2 质量门 + 三个 bug 回归（见 native-1 报告）
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \
-    python3 -m moss_tts_lite.tests.test_fast_native
+# 纯 CPU 类别（无需 flock）：文本层 / 核心 / 发布门禁 Phase 0
+PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_text.py
+PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_core.py
+PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/_merge_check.py
 
 # 量化质量全梯度 / int4pack 内核约定黑盒验证（探针脚本在 .tmp/perf_agent/）
 flock .tmp/gpu.lock python3 .tmp/perf_agent/probe_qquality.py

@@ -502,7 +502,7 @@ class MossCodecStreamer:
     faithful incremental stream must feed the engine in fixed `chunk_frames`
     blocks. `push()` buffers incoming frames and emits wav exactly when a full
     block is available, reproducing `decoder.decode(codes, chunk_duration=8)`
-    bitwise (verified in moss_tts_lite/tests/test_codec.py::test_streamer_matches_decode).
+    bitwise (verified in tests/test_audio.py::test_streamer_matches_decode).
 
     Usage with generation interleave (TTS agent):
         s = MossCodecStreamer(decoder)

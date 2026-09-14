@@ -1,53 +1,169 @@
-"""Watchdog tests v2 — W4 "non-terminating near-silence runaway" (perf-6/7).
+"""Generation tests: greedy/sampled trajectories and the silence watchdog.
 
-v2 fixes two real side effects of the v1 watchdog (supervisor reproductions):
-  1. explicit [pause Xs] markers were truncated by rule (a) (8 s -> 5.12 s):
-     the effective silence threshold now scales with the longest requested
-     pause parsed from the raw text: max(auto, ceil((pause + 2.0) * 12.5));
-  2. healthy long-form single segments (280-char zh ≈ 800 frames) hit the
-     640-frame max_segment floor: rule (b) is now compound — it fires only
-     when the segment is over the floor AND the current tail is already
-     silent (>= 32 consecutive low-energy ch0 frames, 2.56 s), so healthy
-     long segments that keep producing sound never trigger.
+``generate()`` end-to-end trajectory and state-walk checks on real
+weights, plus the watchdog gates (golden EXACT regression, long-form
+false-positive guard, ``[pause Xs]`` preservation, en4 W4 runaway
+reproduction).  GPU, run under the GPU lock.
 
-Phases (GPU, under the lock):
-  B   golden zh/en EXACT regression with the watchdog on (no trigger).
-  L   275-char zh long-form text, bf16 fast: crosses the 640-frame floor,
-      must NOT trigger, must finish naturally (steps/duration reported).
-  P   [pause 8s] text, bf16 fast: must NOT trigger; the wav must keep a
-      >= 7.5 s silent stretch (measured at the -45 dBFS verdict threshold).
-  A   en4 W4 runaway seeds 3005/3009: still caught by rule (a); pre-trigger
-      rows bitwise-identical to the verdict runs; forced end = the model's
-      own delayed_lengths==n_vq closing ramp -> legal codec segments/wav.
+Consolidated from:
+  test_generate.py
+  test_fast_watchdog.py
 
-Run (GPU, under the lock):
-  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \
-      python3 -m moss_tts_lite.tests.test_fast_watchdog
+Run:
+  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_generation.py
 """
+
+from __future__ import annotations
 
 import os
 import sys
+
+# `python3 tests/<this file>.py` straight from the repo root must import
+# moss_tts_lite without an explicit PYTHONPATH.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import soundfile as sf
 import torch
 
-from moss_tts_lite.model import MossTTSModel
-from moss_tts_lite.prompt import build_tts_prompt, build_continuation_prompt
 from moss_tts_lite.cli import _max_pause_s
-from moss_tts_lite.fast import FastMossTTS, generate_fast
 from moss_tts_lite.codec import MossCodecDecoder, delayed_rows_to_segments
+from moss_tts_lite.fast import FastMossTTS, generate_fast
+from moss_tts_lite.generate import generate
+from moss_tts_lite.model import (AUDIO_DELAY_SLOT_TOKEN_ID, AUDIO_END_TOKEN_ID,
+                                 AUDIO_GEN_SLOT_TOKEN_ID, AUDIO_PAD_CODE,
+                                 AUDIO_START_TOKEN_ID, IM_END_TOKEN_ID,
+                                 MossTTSModel)
+from moss_tts_lite.prompt import build_continuation_prompt, build_tts_prompt
+
 try:
     from moss_tts_lite.st_loader import read_safetensors
 except ImportError:  # pragma: no cover
     from tests._mini_loader import read_safetensors_min as read_safetensors
+from tests._mini_bpe import build_tts_prompt_dev
 
-ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.join(os.path.dirname(__file__), ".."))
+# --------------------------------------------------------------------------- #
+# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
+# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
+# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
+# --------------------------------------------------------------------------- #
+ROOT = os.environ.get("MOSS_TTS_ROOT",
+                      os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
 CODEC_DIR = os.path.join(ROOT, "models", "MOSS-Audio-Tokenizer")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
 OUT = os.path.join(ROOT, ".tmp", "perf_agent")
 LISTEN_AGENT = os.path.join(ROOT, ".tmp", "listen_agent")
+
+
+# ------------------------------------------------------------------------- #
+# ---- from test_generate.py ----
+# ------------------------------------------------------------------------- #
+
+
+
+def main_generate():
+    dev = torch.device("cuda")
+    weights = read_safetensors(MODEL_DIR)
+    model = MossTTSModel(weights, device=dev, dtype=torch.bfloat16, max_seq_len=8192)
+    del weights
+    torch.cuda.empty_cache()
+
+    prompt = build_tts_prompt_dev("Hello world, this is a smoke test.")
+    print("prompt L =", prompt["input_ids"].shape[1])
+
+    res = generate(model, prompt, max_new_tokens=200, greedy=True)
+
+    assert res.audio_frames.shape == (res.n_steps, 32), res.audio_frames.shape
+    assert res.text_ids.shape == (res.n_steps,)
+    assert res.n_steps <= 200
+    print(f"greedy: n_steps={res.n_steps}, finished={res.finished}, "
+          f"alloc={torch.cuda.memory_allocated() / 2**30:.2f} GiB, "
+          f"peak={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+
+    t = res.text_ids.tolist()
+    fr = res.audio_frames
+
+    # ---- trajectory shape checks ----
+    if AUDIO_START_TOKEN_ID in t:
+        i_start = t.index(AUDIO_START_TOKEN_ID)
+        # before audio starts: only pad allowed
+        pre = [x for x in t[:i_start] if x != 151643]
+        assert not pre, f"unexpected pre-audio text tokens: {pre[:8]}"
+        i_first_gen = i_start + 1
+        assert t[i_start + 1] == AUDIO_GEN_SLOT_TOKEN_ID, \
+            f"first post-start row must be gen_slot, got {t[i_start + 1]}"
+        # ramp: gen rows between audio_start and the first delay slot (K rows;
+        # K = audio frame count, delay tail fills the remaining channels)
+        i_delay = t.index(AUDIO_DELAY_SLOT_TOKEN_ID)
+        assert i_delay >= i_first_gen, (i_delay, i_first_gen)
+        # delay tail: exactly 32 delay rows (1 sampled + 31 forced), then audio_end
+        # (reference state machine: delayed_lengths runs 0->32; audio_end at ==n_vq)
+        delay_rows = [x for x in t[i_delay:] if x in (AUDIO_DELAY_SLOT_TOKEN_ID, AUDIO_END_TOKEN_ID)]
+        assert delay_rows[0] == AUDIO_DELAY_SLOT_TOKEN_ID
+        k = delay_rows.index(AUDIO_END_TOKEN_ID)
+        assert k == 32, f"expected 32 delay rows before audio_end, got {k}"
+        assert t[i_delay + 32] == AUDIO_END_TOKEN_ID
+        # audio_end row: all channels forced pad
+        assert (fr[i_delay + 32] == AUDIO_PAD_CODE).all(), \
+            "audio_end row must be all-pad"
+        print("delay-pattern trajectory: audio_start@%d, %d gen rows (~%d frames), "
+              "32 delay rows, audio_end@%d" % (i_start, i_delay - i_first_gen,
+                                               i_delay - i_first_gen + 1, i_delay + 32))
+    if res.finished:
+        assert t[-1] == IM_END_TOKEN_ID, f"last token {t[-1]} != im_end"
+        assert IM_END_TOKEN_ID not in t[:-1], "im_end mid-stream"
+    print("text stream:", [hex(x) for x in t[:8]], "...", [hex(x) for x in t[-6:]])
+
+    # ---- pad-code hygiene + independent state-walk over audio masks ----
+    assert fr.min() >= 0 and fr.max() <= 1024
+    real = fr[fr != AUDIO_PAD_CODE]
+    # re-derive expected sampled-channel sets from the text stream using the
+    # reference counter semantics (audio_lengths / delayed_lengths)
+    MAXD = 2**63 - 1
+    al, delayed = 0, MAXD
+    for r, tt in enumerate(t):
+        active = {i for i in range(32) if al > i and (delayed == MAXD or i >= delayed)}
+        row = fr[r].tolist()
+        for i in range(32):
+            if i in active:
+                assert row[i] != AUDIO_PAD_CODE, f"row {r} ch {i} should be sampled"
+            else:
+                assert row[i] == AUDIO_PAD_CODE, f"row {r} ch {i} should be pad, got {row[i]}"
+        if tt in (AUDIO_START_TOKEN_ID, AUDIO_GEN_SLOT_TOKEN_ID, AUDIO_DELAY_SLOT_TOKEN_ID):
+            al += 1
+        elif tt == AUDIO_END_TOKEN_ID:
+            al = 0
+        if delayed == MAXD and tt == AUDIO_DELAY_SLOT_TOKEN_ID:
+            delayed = 0
+        if delayed != MAXD:
+            delayed += 1
+        if delayed > 32:
+            delayed = MAXD
+    print("audio mask state-walk: all 63 rows match reference semantics")
+    print(f"audio frames: {tuple(fr.shape)}, pad-ratio={float((fr == AUDIO_PAD_CODE).float().mean()):.3f}, "
+          + (f"non-pad codes in [{int(real.min())}, {int(real.max())}]" if real.numel() else "all pad"))
+
+    # ---- seeded sampling determinism ----
+    res2 = generate(model, prompt, max_new_tokens=120, greedy=False, seed=1234)
+    res3 = generate(model, prompt, max_new_tokens=120, greedy=False, seed=1234)
+    assert res2.n_steps == res3.n_steps
+    assert torch.equal(res2.text_ids, res3.text_ids), "same seed must reproduce text ids"
+    assert torch.equal(res2.audio_frames, res3.audio_frames), "same seed must reproduce audio"
+    print(f"seeded sampling: n_steps={res2.n_steps}, finished={res2.finished}, "
+          f"deterministic rerun OK")
+
+    print("test_generate PASS")
+
+
+# ------------------------------------------------------------------------- #
+# ---- from test_fast_watchdog.py ----
+# ------------------------------------------------------------------------- #
+try:
+    from moss_tts_lite.st_loader import read_safetensors
+except ImportError:  # pragma: no cover
+    from tests._mini_loader import read_safetensors_min as read_safetensors
+
 
 SR = 24000
 FPS = 12.5
@@ -217,7 +333,7 @@ def phase_a(model):
     return ok
 
 
-def main() -> int:
+def main_fast_watchdog() -> int:
     assert torch.cuda.is_available()
     print("loading weights ...", flush=True)
     weights = read_safetensors(MODEL_DIR)
@@ -241,6 +357,18 @@ def main() -> int:
           f"phasePause={'PASS' if ok_pause else 'FAIL'} "
           f"-> {'PASS' if (ok_a and ok_b and ok_long and ok_pause) else 'FAIL'}")
     return 0 if (ok_a and ok_b and ok_long and ok_pause) else 1
+
+
+# --------------------------------------------------------------------------- #
+# Unified entry point: each source file's own entry function, in order.
+# --------------------------------------------------------------------------- #
+
+def main() -> int:
+    rc = 0
+    rc |= main_generate() or 0
+    rc |= main_fast_watchdog() or 0
+
+    return rc
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ What this module does
    is both wrong and slow.  See the note at `ARMS["n3"]`.
 
 Three bugs were found and fixed while building this; all three are pinned by
-`tests/test_fast_native.py` phase C and verified to bite by mutation.  The
+`tests/test_fast.py` phase C and verified to bite by mutation.  The
 "audio rows diverged from step 1" and "en ran 1766 steps" symptoms both had the
 *same* cause -- `replay()` publishing only `two_buf` in the audio phase, so
 audio tokens were sampled from `model.audio_logits()` on the prefill hidden
@@ -139,7 +139,7 @@ def text_decision(dl: int, n_vq: int, wd_stop: bool, is_stopping: bool,
     `audio_end` (and `sampling_text` turns the sampling block back on, which is
     what keeps the RNG stream aligned with the reference).  Note the honest
     scope: on the golden zh/en prompts both variants happen to reach the same
-    step count, so this is pinned by `tests/test_fast_native.py` phase C as a
+    step count, so this is pinned by `tests/test_fast.py` phase C as a
     differential table against the reference branch block, not by an observed
     step-count difference.
 

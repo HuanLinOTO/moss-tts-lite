@@ -1,24 +1,48 @@
-"""Tests for moss_tts_lite.codec (MossCodecDecoder).
+"""Audio-codec tests: MossCodecDecoder / MossCodecStreamer.
 
-Run:  python3 -m moss_tts_lite.tests.test_codec
+Weight-norm reconstruction, decode shape/amplitude sanity, chunked vs
+full bitwise equality, streamer parity, the delay-pattern segment
+splitter, and SNR parity against the reference HF decode.
 GPU required (~4 GB fp32); wrap with flock .tmp/gpu.lock when sharing.
+
+Consolidated from:
+  test_codec.py
+
+Run:
+  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_audio.py
 """
+
+from __future__ import annotations
 
 import os
 import sys
 
+# `python3 tests/<this file>.py` straight from the repo root must import
+# moss_tts_lite without an explicit PYTHONPATH.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from moss_tts_lite.codec import MossCodecDecoder
 
-from moss_tts_lite.codec import MossCodecDecoder  # noqa: E402
-
-ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# --------------------------------------------------------------------------- #
+# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
+# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
+# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
+# --------------------------------------------------------------------------- #
+ROOT = os.environ.get("MOSS_TTS_ROOT",
+                      os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-Audio-Tokenizer")
 GOLDEN_WAV = os.path.join(ROOT, ".tmp", "golden", "codec_golden.wav")
 GOLDEN_CODES = os.path.join(ROOT, ".tmp", "golden", "codec_golden_codes.pt")
 GEN_GOLDEN = os.path.join(ROOT, ".tmp", "golden", "gen_golden.pt")
+
+
+# ------------------------------------------------------------------------- #
+# ---- from test_codec.py ----
+# ------------------------------------------------------------------------- #
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -216,7 +240,7 @@ def test_delayed_rows_to_segments_edges():
           f"rows={[s.shape[0] for s in segs]})")
 
 
-def main():
+def main_codec():
     test_weight_norm_matches_torch()
     test_random_codes_shapes_and_sanity()
     test_chunked_vs_full_small()
@@ -228,5 +252,16 @@ def main():
     print("ALL CODEC TESTS PASSED")
 
 
+# --------------------------------------------------------------------------- #
+# Unified entry point: each source file's own entry function, in order.
+# --------------------------------------------------------------------------- #
+
+def main() -> int:
+    rc = 0
+    rc |= main_codec() or 0
+
+    return rc
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -754,7 +754,7 @@ class CapturingMossTTS(MossTTSModel):
     `cap_slots` is cleared at the start of every `prefill`/`step`, so it holds
     the tensors of the most recent forward only ([1, T, K] each).  Nothing is
     modified in place, hence capture cannot perturb numerics — verified bitwise
-    against the base class in `moss_tts_lite/tests/test_gptq.py` phase G6.
+    against the base class in `tests/test_quant.py` phase G6.
     """
 
     def __init__(self, *args, **kwargs):

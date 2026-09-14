@@ -1,31 +1,37 @@
-"""TTS golden parity (task 5): teacher-forced logits + full-generation
-trajectories vs asset-produced golden files.
+"""Golden-parity tests: tokenizer, prompt, logits and full generation.
 
-  Phase A  .tmp/golden/logits_golden.npz  (zh prompt, seed=1234, 40 steps)
-      logits_text  [40, 155648] fp32  raw last-position logits (pre-temperature,
-                   pre-masking); audio heads already carry -inf at index 1024.
-      logits_audio [40, 32, 1025] fp32
-      selected_rows[40, 33] int64   the row fed to the next step
-      Gate: max|delta| <= 0.05, argmax agreement >= 99% (per head set).
+Phase 1 tokenizer + prompt parity against the asset-produced golden
+files; Phase 2 teacher-forced 40-step logits parity and full zh/en
+generation parity vs .tmp/golden; Phase 3 the CLI-equivalent
+end-to-end wav comparison and speed baseline.  GPU, under the lock.
 
-  Phase B  .tmp/golden/gen_golden.pt  (zh 137 steps + en 174 steps, seed=1234,
-      default sampling params, raw delay-pattern generation_ids [T,33])
-      Gate: report exact token agreement; 100% match expected when the RNG
-      stream and state machine are faithful.
+Consolidated from:
+  test_golden_parity.py
+  test_tts_parity.py
+  test_e2e.py
 
-Run (GPU, under the lock):
-  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True flock .tmp/gpu.lock \
-      python3 -m moss_tts_lite.tests.test_tts_parity
+Run:
+  PYTHONPATH=. MOSS_TTS_ROOT=/root/MOSS-TTS python3 tests/test_parity.py
 """
 
-import json
+from __future__ import annotations
+
 import os
 import sys
 
+# `python3 tests/<this file>.py` straight from the repo root must import
+# moss_tts_lite without an explicit PYTHONPATH.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import json
+
 import numpy as np
+import soundfile as sf
 import torch
 import torch.nn.functional as F
 
+from moss_tts_lite.bpe import QwenBPE
+from moss_tts_lite.cli import synthesize
 from moss_tts_lite.model import (
     AUDIO_END_TOKEN_ID,
     AUDIO_GEN_SLOT_TOKEN_ID,
@@ -37,15 +43,105 @@ from moss_tts_lite.model import (
     PAD_TOKEN_ID,
     MossTTSModel,
 )
+from moss_tts_lite.prompt import build_tts_prompt
 from moss_tts_lite.sampling import find_last_equal_C, sample_token
+
 try:  # prefer the real loader (tok-delivered); fall back to the temp mini one
     from moss_tts_lite.st_loader import read_safetensors
 except ImportError:
     from tests._mini_loader import read_safetensors_min as read_safetensors
 
-ROOT = os.environ.get("MOSS_TTS_ROOT", os.path.join(os.path.dirname(__file__), ".."))
+# --------------------------------------------------------------------------- #
+# Unified root resolution.  MOSS_TTS_ROOT points at the MOSS-TTS asset checkout
+# (weights, tokenizers, golden assets); it defaults to this repo's parent, so a
+# checkout that keeps ``models/`` beside ``tests/`` works unchanged.
+# --------------------------------------------------------------------------- #
+ROOT = os.environ.get("MOSS_TTS_ROOT",
+                      os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 MODEL_DIR = os.path.join(ROOT, "models", "MOSS-TTS-v1.5")
 GOLDEN = os.path.join(ROOT, ".tmp", "golden")
+OUT_DIR = os.path.join(ROOT, ".tmp", "tts_agent")
+SR = 24000
+
+
+# ------------------------------------------------------------------------- #
+# ---- from test_golden_parity.py ----
+# ------------------------------------------------------------------------- #
+
+
+
+def test_tok_golden():
+    path = os.path.join(GOLDEN, "tok_golden.json")
+    if not os.path.exists(path):
+        print("  [pending] .tmp/golden/tok_golden.json not present")
+        return
+    with open(path, encoding="utf-8") as f:
+        golden = json.load(f)
+    lines, ref_ids = golden["lines"], golden["ids"]
+    bpe = QwenBPE(os.path.join(MODEL_DIR, "vocab.json"),
+                  os.path.join(MODEL_DIR, "merges.txt"),
+                  os.path.join(MODEL_DIR, "tokenizer.json"))
+    n_bad = 0
+    for i, (line, want) in enumerate(zip(lines, ref_ids)):
+        got = bpe.encode(line)
+        if got != want:
+            n_bad += 1
+            print(f"  tok MISMATCH line {i}: {line[:50]!r}")
+            if n_bad <= 5:
+                for j, (a, b) in enumerate(zip(got, want)):
+                    if a != b:
+                        print(f"    first diff @{j}: mine={a} hf={b}")
+                        break
+                else:
+                    print(f"    length mine={len(got)} hf={len(want)}")
+    assert n_bad == 0, f"{n_bad}/{len(lines)} tokenizer golden cases mismatch"
+    print(f"  tok_golden: {len(lines)}/{len(lines)} lines 100% identical "
+          f"({sum(len(x) for x in ref_ids)} tokens)")
+
+
+def test_prompt_golden():
+    path = os.path.join(GOLDEN, "prompt_golden.pt")
+    if not os.path.exists(path):
+        print("  [pending] .tmp/golden/prompt_golden.pt not present")
+        return
+    golden = torch.load(path, map_location="cpu", weights_only=True)
+    n_ok = 0
+    for case, ref_ids, ref_mask in zip(golden["cases"], golden["input_ids"],
+                                       golden["attention_mask"]):
+        kwargs = case["kwargs"]
+        mine = build_tts_prompt(kwargs["text"],
+                                language=kwargs.get("language"),
+                                tokens=kwargs.get("tokens"))
+        same_ids = torch.equal(ref_ids, mine["input_ids"])
+        same_mask = torch.equal(ref_mask, mine["attention_mask"])
+        assert same_ids, (
+            f"prompt input_ids mismatch for case {case['name']}: "
+            f"L_ref={ref_ids.shape[1]} L_mine={mine['input_ids'].shape[1]}")
+        assert same_mask, f"attention_mask mismatch for case {case['name']}"
+        n_ok += 1
+        print(f"  prompt[{case['name']}]: L={ref_ids.shape[1]} "
+              f"input_ids identical, mask identical")
+    print(f"  prompt_golden: {n_ok}/{len(golden['cases'])} cases 100% identical")
+
+
+
+
+def main_golden_parity() -> int:
+    print(f"[{os.path.basename(__file__)}]")
+    test_tok_golden()
+    test_prompt_golden()
+    print("ALL TESTS PASSED")
+    return 0
+
+
+# ------------------------------------------------------------------------- #
+# ---- from test_tts_parity.py ----
+# ------------------------------------------------------------------------- #
+try:  # prefer the real loader (tok-delivered); fall back to the temp mini one
+    from moss_tts_lite.st_loader import read_safetensors
+except ImportError:
+    from tests._mini_loader import read_safetensors_min as read_safetensors
+
 
 PAD = PAD_TOKEN_ID
 IM_START = 151644
@@ -288,7 +384,7 @@ def phase_b(model, pg, gg):
     return all_ok
 
 
-def main() -> int:
+def main_tts_parity() -> int:
     assert torch.cuda.is_available()
     pg = torch.load(os.path.join(GOLDEN, "prompt_golden.pt"),
                     map_location="cpu", weights_only=False)
@@ -311,6 +407,94 @@ def main() -> int:
     print(f"tts_parity: phase_a={'PASS' if ok_a else 'FAIL'} "
           f"phase_b={'PASS' if ok_b else 'FAIL'}")
     return 0 if (ok_a and ok_b) else 1
+
+
+# ------------------------------------------------------------------------- #
+# ---- from test_e2e.py ----
+# ------------------------------------------------------------------------- #
+
+
+
+def _steps_ps(step_ms, skip=0):
+    ms = step_ms[skip:]
+    if not ms:
+        return float("nan")
+    return 1000.0 / (sum(ms) / len(ms))
+
+
+def main_e2e() -> int:
+    gg = torch.load(os.path.join(GOLDEN, "gen_golden.pt"),
+                    map_location="cpu", weights_only=False)
+    zh = next(c for c in gg["cases"] if c["case_name"] == "zh_plain")
+    en = next(c for c in gg["cases"] if c["case_name"] == "en_language")
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    # ---------- 1) zh: golden text -> wav, compare with codec_golden.wav ----------
+    print("=== E2E zh (golden text, seed=1234) ===", flush=True)
+    stats: dict = {}
+    wav, sr, res, strategy = synthesize(
+        zh["text"], os.path.join(OUT_DIR, "e2e_zh.wav"),
+        seed=zh["seed"], max_new_tokens=4096,
+        sampling=dict(zh["sampling"]), stats=stats)
+    assert sr == SR, sr
+    assert torch.equal(res.audio_frames, zh["generation_ids"][:, 1:]), \
+        "audio codes no longer EXACT vs gen_golden"
+    assert res.finished and res.n_steps == zh["n_steps"]
+    print(f"codes EXACT vs gen_golden (T={res.n_steps}), vram_strategy={strategy}")
+
+    ref, sr_ref = sf.read(os.path.join(GOLDEN, "codec_golden.wav"), dtype="float32")
+    assert sr_ref == SR
+    L = min(len(wav), len(ref))
+    d = np.abs(wav[:L].astype(np.float64) - ref[:L].astype(np.float64))
+    dur = len(wav) / SR
+    print(f"wav: {len(wav)} samples ({dur:.3f}s) vs golden {len(ref)} "
+          f"({len(ref) / SR:.3f}s); max|d|={d.max():.3e} mean|d|={d.mean():.3e}")
+    assert abs(dur - 8.24) <= 0.01, f"duration {dur:.4f}s outside 8.24+-0.01"
+    assert len(wav) == len(ref), "sample count differs from golden"
+    assert d.max() < 1e-4, f"wav max|d|={d.max():.3e} >= 1e-4"
+    print("E2E zh vs codec_golden.wav: PASS (<1e-4, 8.24s+-0.01)")
+
+    # ---------- 2) speed baseline (from the zh run above) ----------
+    prefill_ms = stats.get("prefill_ms")
+    step_ms = stats.get("step_ms") or []
+    print("=== speed baseline (bf16, A10G, zh 137 steps) ===")
+    print(f"prefill: {prefill_ms:.1f} ms (L={zh['prompt_L']})")
+    print(f"decode:  avg {sum(step_ms) / len(step_ms):.2f} ms/step over "
+          f"{len(step_ms)} steps -> {1000 / (sum(step_ms) / len(step_ms)):.1f} steps/s "
+          f"(incl. prefill-equivalent first step amortized)")
+    print(f"decode:  steady-state (steps 10+) {_steps_ps(step_ms, 10):.1f} steps/s "
+          f"({sum(step_ms[10:]) / len(step_ms[10:]):.2f} ms/step)")
+
+    # ---------- 3) en artifact for manual listening ----------
+    print("=== E2E en (manual-listening artifact) ===", flush=True)
+    stats_en: dict = {}
+    wav_en, _, res_en, strat_en = synthesize(
+        en["text"], os.path.join(OUT_DIR, "e2e_en.wav"),
+        language=en["kwargs"].get("language"), seed=en["seed"],
+        max_new_tokens=4096, sampling=dict(en["sampling"]), stats=stats_en)
+    assert torch.equal(res_en.audio_frames, en["generation_ids"][:, 1:]), \
+        "en audio codes no longer EXACT vs gen_golden"
+    dur_en = len(wav_en) / SR
+    ms_en = stats_en.get("step_ms") or []
+    print(f"wrote {os.path.join(OUT_DIR, 'e2e_en.wav')}: {dur_en:.2f}s, "
+          f"codes EXACT, strategy={strat_en}, steady {_steps_ps(ms_en, 10):.1f} steps/s")
+    assert dur_en > 1.0
+
+    print("test_e2e PASS")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Unified entry point: each source file's own entry function, in order.
+# --------------------------------------------------------------------------- #
+
+def main() -> int:
+    rc = 0
+    rc |= main_golden_parity() or 0
+    rc |= main_tts_parity() or 0
+    rc |= main_e2e() or 0
+
+    return rc
 
 
 if __name__ == "__main__":
