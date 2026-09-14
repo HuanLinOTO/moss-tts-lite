@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moss-tts-lite"
+version = "1.0.0"
+description = "Minimal MOSS-TTS-v1.5 inference stack: 4 dependencies, bitwise-exact + fast decode paths, W4 GPTQ tiers, 8GB-card support"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [{ name = "baicai-1145" }]
+keywords = ["tts", "text-to-speech", "moss-tts", "quantization", "gptq", "int4", "cuda"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.5",
+    "numpy",
+    "soundfile",
+    "pyyaml",
+]
+
+[project.urls]
+Homepage = "https://github.com/baicai-1145/moss-tts-lite"
+Repository = "https://github.com/baicai-1145/moss-tts-lite"
+"Model (HF)" = "https://huggingface.co/baicai1145/MOSS-TTS-v1.5-W4GPTQ-w1"
+"Model (ModelScope)" = "https://modelscope.cn/models/baicai1145/MOSS-TTS-v1.5-W4GPTQ-w1"
+
+[project.scripts]
+moss-tts-lite = "moss_tts_lite.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["moss_tts_lite"]
+
+[tool.uv]
+# CUDA torch wheels are not on PyPI's default index; uv users should run:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+# (or cu121/cu129 per their CUDA), then `uv pip install -e .`
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
