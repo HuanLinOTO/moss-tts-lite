@@ -140,25 +140,9 @@ def build_tts_prompt(text: str, language: str | None = None,
     return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
-# --------------------------------------------------------------------------- #
-# Continuation-mode prompts (listen2 addition; no existing function changed).  #
-#                                                                              #
-# Replicates MossTTSDelayProcessor.__call__(mode="continuation") for the       #
-# two-turn conversation [user_text, assistant_audio_prefix]:                   #
-#   * user turn:  same <user_inst> template as build_tts_prompt, but rendered  #
-#     by chat_template.jinja WITHOUT add_generation_prompt (an assistant       #
-#     message follows).                                                        #
-#   * assistant turn: content = AUDIO_PLACEHOLDER ("<|audio|>"), which         #
-#     _replace_audio_placeholders expands to                                   #
-#         <|audio_start|> + gen_slot*T + delay_slot*(n_vq-1) + <|audio_end|>   #
-#     before encoding (assistant slot strings, not the user ones).             #
-#   * _get_unified_codes(role="assistant", truncation=True): audio channels    #
-#     = pad rows up to and including audio_start, then                         #
-#     apply_delay_pattern(prefix_codes) with the LAST n_vq-1 ramp-out rows     #
-#     dropped (truncation semantics); the text channel is cut to the same      #
-#     length, so the prompt ends on the final gen_slot row -- exactly the      #
-#     state is_continuation expects in generate/generate_fast.                 #
-# --------------------------------------------------------------------------- #
+# Continuation mode: two-turn conversation [user_text, assistant_audio_prefix].
+# Mirrors MossTTSDelayProcessor(mode="continuation"); the delay/truncation
+# semantics are documented in build_continuation_prompt's docstring.
 
 # Assistant-side slot token STRINGS are the tokenizer.json added-token names
 # (the fast tokenizer is authoritative; added_tokens.json names the same ids

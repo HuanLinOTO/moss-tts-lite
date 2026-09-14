@@ -72,11 +72,8 @@ MODEL_DIR = os.environ.get("MOSS_TTS_MODEL_DIR") or os.path.join(
 CODEC_DIR = os.environ.get("MOSS_TTS_CODEC_DIR") or os.path.join(
     os.path.dirname(__file__), "..", "models", "MOSS-Audio-Tokenizer")
 
-# ---- GPTQ states (offline artifacts, ~4 GiB, not shipped in git) ----
-# Resolution order: --gptq-state > $MOSS_TTS_GPTQ_DIR > <model_dir>/gptq/.
-# Download the released standalone exports (HF/ModelScope, see README)
-# instead of regenerating; the quantization pipeline lives in the upstream
-# development workspace.
+# Resolution: --gptq-state > $MOSS_TTS_GPTQ_DIR > <model_dir>/gptq/
+# (offline artifacts, not shipped; standalone exports on HF/ModelScope).
 GPTQ_PRESETS = {"w1": "w1.pt", "w1p": "w1p.pt", "w2": "w2.pt"}
 GPTQ_DEFAULT_PRESET = "w1p"
 GPTQ_REGEN_HINT = (
@@ -85,17 +82,11 @@ GPTQ_REGEN_HINT = (
 
 SR = 24000
 
-#: KV-cache sizing.
-#: The delay state machine spends extra positions per utterance beyond
-#: `max_new_tokens`: after the last emitted audio row the 32-channel delay ramp
-#: still has to flush (`n_vq` steps), and the audio_end/ramp-out rows add a few
-#: more.  64 covers the measured worst case across zh/en/pause/continuation with
-#: a wide margin (`max_new_tokens` is an upper bound on `n_steps`, so the real
-#: overshoot is bounded by the ramp-out: measured 34 rows for a normal end).
+#: The delay-ramp flush needs positions beyond max_new_tokens; 64 covers the
+#: worst case (normal end: 34 ramp-out rows).
 KV_RAMP_MARGIN = 64
 
-#: default KV-cache size for the *library* entry points (`synthesize`,
-#: `MossTTSModel`); the CLI overrides it with the on-demand size below.
+#: Library default; the CLI overrides it with the on-demand size below.
 DEFAULT_MAX_SEQ_LEN = 8192
 
 _BUILTIN_DEFAULTS = {
@@ -114,15 +105,14 @@ _BUILTIN_DEFAULTS = {
     "audio_top_p": 0.8,
     "audio_top_k": 25,
     "audio_repetition_penalty": 1.0,
-    "fast": True,          # fast is the DEFAULT; --eager selects the slow path
+    "fast": True,  # default; --eager selects the slow path
     "fast_native": False,
     "watchdog": True,
     "watchdog_silence_frames": None,
     "watchdog_max_segment_frames": None,
 }
 
-# [pause 8s] / [pause 1.5s] markers in the raw input text; the watchdog must
-# not mistake a requested pause for runaway silence.
+# [pause Ns] markers are requested silence, not runaway: excluded below.
 _PAUSE_RE = re.compile(r"\[pause\s*(\d+(?:\.\d+)?)s\]", re.IGNORECASE)
 
 
@@ -131,9 +121,6 @@ def _max_pause_s(text: str) -> float | None:
     return max(vals) if vals else None
 
 
-# --------------------------------------------------------------------------- #
-# KV-cache sizing (kvfit).  KV-cache sizing rationale (measured on A10G).       #
-# --------------------------------------------------------------------------- #
 def _kv_mib(n_seq: int) -> float:
     """KV bytes for `n_seq` positions: layers * 2 (K,V) * kv_heads * head_dim * bf16."""
     return n_seq * 36 * 2 * 8 * 128 * 2 / 2**20
@@ -321,21 +308,16 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
             codec = MossCodecDecoder(codec_dir, device=dev)
         standalone = is_standalone_dir(model_dir)
         tokenizer = _standalone_tokenizer(model_dir) if standalone else None
-        # ---- prompt first: L0 fixes the on-demand KV size -------------------
+        # prompt first: L0 fixes the on-demand KV size
         prompt = build_tts_prompt(text, language=language, tokenizer=tokenizer)
         want_seq = _resolve_max_seq_len(max_seq_len, int(prompt["input_ids"].shape[1]),
                                         max_new_tokens)
         if standalone:
-            # self-contained quantized export: the int4 payloads AND the
-            # tokenizer files live inside the model dir, so nothing is read
-            # from the default models/ layout.
             if gptq_state:
                 raise SystemExit(
                     "[moss_tts_lite] --gptq-state cannot be combined with a "
                     "standalone model dir (the quantization is inside it)")
             if not fast:
-                # Only reachable through the API (`fast=False`) or `--eager`: a
-                # standalone export has no bf16 weights to run eagerly.
                 raise SystemExit(
                     "[moss_tts_lite] --model-dir is a standalone quantized "
                     "export: it only runs the fast/quant decode path, so "
@@ -350,11 +332,6 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
             elif gptq_state:
                 fast_model = load_gptq_fast(model, gptq_state)
             else:
-                # `w4_group_size=None` must NOT be passed through: it would
-                # override FastMossTTS's own default (128) and trip its
-                # 32/64/128/256 validation, which is what made bare `--fast`
-                # fail with "w4_group_size must be 32/64/128/256" (pre-existing
-                # at bc5415f; only the --quant tiers set it explicitly).
                 _fkw = {} if w4_group_size is None else {"w4_group_size": w4_group_size}
                 fast_model = FastMossTTS(model, quant=quant, **_fkw)
             if fast_native:
@@ -584,7 +561,7 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     cfg = {**_BUILTIN_DEFAULTS, **_yaml_defaults(args.config)}
-    # CLI flags win over YAML; a flag left at None was not given.
+    # CLI flags (non-None) win over YAML
     if args.language is not None:
         cfg["language"] = args.language
     if args.seed is not None:
@@ -603,18 +580,16 @@ def main(argv=None) -> int:
         cfg["fast"] = False
         cfg["fast_native"] = False
         if args.fast:
-            # contradictory flags: last one wins would be silent, so say so
+            # contradiction: refuse instead of silent last-wins
             print("[moss_tts_lite] --eager wins over --fast (--fast is a no-op "
                   "alias anyway); running the eager reference path",
                   file=sys.stderr)
     if args.fast:
-        # Kept for compatibility: the default is already the fast path, so the
-        # flag has nothing left to switch on.
+        # no-op alias (fast is the default), kept for compatibility
         if not args.eager:
             print("[--fast is now the default; this flag is a no-op]",
                   file=sys.stderr)
     if args.fast_native:
-        # implies the fast path; the native tier needs the quantized container
         cfg["fast"] = True
         cfg["fast_native"] = True
     if args.eager and args.fast_native:
@@ -622,10 +597,6 @@ def main(argv=None) -> int:
                          "exclusive (--eager is the reference slow path, "
                          "--fast-native the fastest CUDA-graph tier)")
     if cfg["device"] == "cpu":
-        # The fast path is CUDA-graph based, so the default flip would break
-        # `--device cpu` outright.  Fall back to the reference path instead of
-        # crashing (this is the one case where eager is forced, and the note
-        # says why).
         if cfg["fast_native"]:
             raise SystemExit("[moss_tts_lite] --fast-native requires CUDA "
                              "(whole-step CUDA graphs)")
@@ -636,14 +607,10 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             cfg["fast"] = False
     if args.fast_native and cfg["greedy"]:
-        # generate_native() samples; greedy would need an argmax path that the
-        # whole-step graph does not implement (the reference's greedy branch is
-        # a different sampling call sequence)
+        # the native tier samples; no argmax path exists
         raise SystemExit("[moss_tts_lite] --fast-native cannot be combined with "
                          "--greedy (the native tier samples)")
-    # A standalone export is self-describing (meta.json): --quant then only
-    # selects *which* preset, and the offline-state resolution below must be
-    # skipped (there is no separate state file).
+    # standalone dirs are self-describing (meta.json); no separate state file
     standalone_preset = None
     if args.model_dir and is_standalone_dir(args.model_dir):
         standalone_preset = standalone_presets(args.model_dir)[0]
@@ -666,10 +633,7 @@ def main(argv=None) -> int:
                     f"or point --model-dir at the {want!r} export")
         print(f"[moss_tts_lite] standalone quantized export detected: using its "
               f"built-in preset {standalone_preset!r}")
-    # --quant only exists on the fast path.  Fast is the default, so --quant no
-    # longer switches anything on; the old "--quant implies --fast" notice is
-    # obsolete (there is nothing left for it to switch on), and --eager is the
-    # one combination that cannot work.
+    # --quant needs the fast path; --eager cannot carry it
     if args.quant is not None and args.eager:
         raise SystemExit("[moss_tts_lite] --quant cannot be combined with --eager: "
                          "weight quantization is only implemented on the fast "

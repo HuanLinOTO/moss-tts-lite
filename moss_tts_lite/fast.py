@@ -1,4 +1,4 @@
-"""CUDA-graph accelerated decode for MOSS-TTS (perf agent file).
+"""CUDA-graph accelerated decode for MOSS-TTS.
 
 FastMossTTS wraps an already-built MossTTSModel and replays its exact decode
 op sequence from static CUDA graphs.  Numerics policy: every tensor op inside
@@ -422,9 +422,9 @@ class FastMossTTS:
 
 
 # --------------------------------------------------------------- watchdog -
-# Calibrated against the verdict-1 W4 runaway corpus (perf-6-watchdog.md):
-# ch0 (coarsest RVQ code, NOT delay-shifted) values whose mean decoded frame
-# energy over the 100-run verdict corpus is <= -45 dBFS (n >= 20 occurrences).
+# Calibrated against a 100-run W4 runaway corpus:
+# ch0 (coarsest RVQ code) values whose mean decoded frame energy across that
+# corpus is <= -45 dBFS (n >= 20 occurrences).
 # Consecutive raw ch0 runs of these codes: 3 known runaway generations hit
 # 190/204/319 frames; all 97 normal runs stay <= 44 (99th pct 44); golden bf16
 # zh/en <= 8.  Threshold 64 frames (5.12 s) sits 1.45x above the normal max
@@ -553,7 +553,7 @@ def generate_fast(
     captured = False
 
     # ---- production watchdog (fast path only; exact path untouched) -------
-    # Detects the W4 "non-terminating near-silence" runaway (verdict-1 §五):
+    # Detects the "non-terminating near-silence" runaway:
     #   (a) >= watchdog_silence_frames consecutive fully-sampled audio rows
     #       whose ch0 code is in the calibrated low-energy set;
     #   (b) current segment length al > max(floor, 2 x longest completed

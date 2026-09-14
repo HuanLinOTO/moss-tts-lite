@@ -504,7 +504,7 @@ class MossCodecStreamer:
     block is available, reproducing `decoder.decode(codes, chunk_duration=8)`
     bitwise (verified in tests/test_audio.py::test_streamer_matches_decode).
 
-    Usage with generation interleave (TTS agent):
+    Usage with generation interleave:
         s = MossCodecStreamer(decoder)
         for frame_batch in gen_frames:            # LongTensor [n, 32]
             wav = s.push(frame_batch)             # np.ndarray or None
@@ -567,7 +567,7 @@ class MossCodecStreamer:
 
 
 # ---------------------------------------------------------------------------
-# TTS generation rows -> code segments (glue for the TTS agent)
+# TTS generation rows -> decode-ready code segments
 # ---------------------------------------------------------------------------
 
 def delayed_rows_to_segments(

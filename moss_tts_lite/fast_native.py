@@ -53,7 +53,7 @@ from .sampling import sample_token
 
 _INT64_MAX = 9223372036854775807
 
-#: ablation arms (see `.reports/native-1.md`)
+#: decode arms
 #:   n1 = whole-step graph only: one graph per step (attention still fast.py's
 #:        exact-length call), everything else exactly as `fast.py` does it
 #:   n2 = n1 + fused heads + fused (q,k)/(gate,up) int4 GEMMs + `F.rms_norm`
@@ -61,21 +61,14 @@ _INT64_MAX = 9223372036854775807
 ARMS: dict[str, dict] = {
     "n1": dict(legacy=True, fuse_heads=False, fuse_gemms=False,
                fused_norm=False, in_graph_sample=False),
-    # single-feature arms for the ablation table
     "n2n": dict(legacy=False, fuse_heads=False, fuse_gemms=False,
                 fused_norm=True, in_graph_sample=False),
     "n2h": dict(legacy=False, fuse_heads=True, fuse_gemms=True,
                 fused_norm=False, in_graph_sample=False),
     "n2": dict(legacy=False, fuse_heads=True, fuse_gemms=True,
                fused_norm=True, in_graph_sample=False),
-    # n3 is kept for reference but is NOT a win: moving sampling into the graph
-    # draws all 32 channels every step (vs fast.py's channel-subset draws) so
-    # the RNG stream diverges from the reference, which on this model makes the
-    # trajectory run past any usable bound (measured: zh 3170 steps vs 127,
-    # en never terminating within 4096).  It is also slower, because the
-    # per-length graph cache thrashes once a run exceeds max_graphs.  n2 is the
-    # default: it keeps fast.py's exact sampling calls (and so its RNG stream)
-    # and only changes the graph structure and GEMM/norm kernels.
+    # n3 (in-graph sampling) reorders the RNG stream and trajectories run
+    # away; kept unfollowed only for reference.  n2 is the default.
     "n3": dict(legacy=False, fuse_heads=True, fuse_gemms=True,
                fused_norm=True, in_graph_sample=True),
 }
@@ -518,7 +511,7 @@ class FastNativeTTS:
     # ------------------------------------------------------------- bucketing
     #: Why one graph per cache length instead of a fixed bucket ladder:
     #: attention must read exactly the first `length` K/V rows to reproduce the
-    #: reference numerics.  Every padded alternative was measured and rejected
+    #: reference numerics; padded/bucketed alternatives break bitwise equality
     #: -- a zero pad row scores 0, which the softmax weights as `exp(-lse)`, and
     #: on this model that share reaches 0.85-1.0 (the attention logit spread is
     #: large), so pad rows can dominate the output; a `bucket`-sized `-inf`
@@ -841,7 +834,7 @@ def generate_native(
             # (An earlier revision only took `two_step` in the audio phase,
             # which left `la_step = None` and made the audio tokens fall back
             # to `model.audio_logits(h)` on the *prefill* hidden state -- the
-            # stale-head bug behind the audio rows diverging from step 1.)
+            # stale-head bug.)
             two_step = native.two_buf
             la_step = native.la_buf
         _t1(e0, "prefill" if time_step == 0 else "step")

@@ -1,6 +1,6 @@
 """GPTQ (error-compensating) W4 quantization for the FastMossTTS int4pack path.
 
-Owner: gptq agent.  Offline use only: this module never runs inside the
+Offline use only: this module never runs inside the
 generation loop.  Its product is a set of *packed* weights in exactly the
 format `moss_tts_lite/fast.py` already consumes, so the runtime keeps the same
 fused `_weight_int4pack_mm` kernel, the same group size and the same memory

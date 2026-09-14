@@ -179,7 +179,7 @@ DEFAULT_TIE_CONVENTION_SECTION = r"""### 3.1 关于 top-25 数字的口径（重
   与旧版本报告可直接对照。
 
 两个口径的方向一致；**幅度不可跨口径比较**（tie 主导时旧口径会把同等真实增益放大约 7 倍）。
-评估方法、并列证据与全部口径对照见仓库内 `gencheck-1-lang-emo.md`。"""
+两个口径方向一致；幅度不可跨口径比较。"""
 
 # Fallback label of the single top-25 row for presets without a tie-robust
 # measurement (the number itself is the CUDA-topk gate figure).
@@ -292,7 +292,8 @@ def _sha256_file(path: str) -> tuple[int, str]:
 # base-checkpoint provenance
 # ---------------------------------------------------------------------------
 def _hash_cache_path(repo_root: str) -> str:
-    return os.path.join(repo_root, ".tmp", "export_agent", "base_hashes.json")
+    """Cache for base-checkpoint hashes (created on first use)."""
+    return os.path.join(repo_root, ".cache", "base_hashes.json")
 
 
 def base_provenance(model_dir: str, hash_base: bool = True) -> dict:
@@ -673,7 +674,7 @@ def render_model_card(template: str, meta: dict, preset_name: str) -> str:
         f"`{s.get('sha256', 'not hashed')[:16]}…` |" for s in shards)
     keeps = (f"{len(preset['bf16_linears'])} projections kept bf16"
              + (f" — {m.get('bf16_keeps')}" if m.get("bf16_keeps") else ""))
-    # ---- tie-convention reporting (gencheck-1/2/3) --------------------------
+    # ---- tie-convention reporting -------------------------------------------
     # The top-25 number is tie-convention dependent: a preset that HAS a
     # tie-robust measurement reports it as the primary figure alongside the
     # historical CUDA-topk number, the per-stratum gains and mean |Δlogit|.
