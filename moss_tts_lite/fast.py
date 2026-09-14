@@ -16,7 +16,7 @@ graph-capturable, all value-preserving:
     cache length, the identical call used by model._layer).  A padded
     masked-bucket attention would dispatch to a different SDPA kernel and
     change bf16 rounding (probed: flash no-mask != mem-efficient masked,
-    see .tmp/reports/perf-m1-cuda-graph.md), so whole-step capture is
+    measured; see git history), so whole-step capture is
     numerically out under the EXACT gate; 38 sub-graphs (1 + n_layers + 1
     audio-phase head variant) bracket the 36 eager attentions instead
     (1 launch each instead of ~25 kernels).

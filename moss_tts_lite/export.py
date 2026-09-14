@@ -3,7 +3,7 @@
 Background
 ----------
 `models/MOSS-TTS-v1.5/gptq/w1.pt` (the offline GPTQ state produced by
-`.tmp/gptq_agent/run_gptq.py` + `merge_states.py`) holds *only* the packed
+the upstream GPTQ pipeline) holds *only* the packed
 int4 payloads; every other tensor (embeddings, the 33 heads, norms, the
 bf16-kept projections) still has to come from the 16.6 GB bf16 base
 checkpoint.  Downloading 16.6 GB to run an 8.3 GiB quantized model is a
@@ -35,7 +35,7 @@ key (`language_model.layers.{i}.self_attn.v_proj.weight`, `emb_ext.3.weight`,
 drop-in partial replacement for the base shards.  Consequence: assembling the
 runtime model never needs the base directory, and the assembled module is
 bit-identical to the current `base + w1.pt` path (see
-`.tmp/reports/export-1-standalone.md`).
+the upstream development workspace).
 
 No GPU is used by the exporter and no weight is materialized in RAM: the base
 shards are mmap'd with `st_loader.read_safetensors`, the state is mmap'd with
@@ -108,10 +108,10 @@ _Q_RE = re.compile(r"^layers\.(\d+)\.(" + "|".join(_LIN_NAMES) + r")\.(q|qsz)$")
 # .gitattributes for the exported directory (big file -> LFS on HF/MS).
 _GITATTRIBUTES_FALLBACK = "*.safetensors filter=lfs diff=lfs merge=lfs -text\n"
 
-# Measured metrics of the shipped presets (source: .tmp/reports/gptq-2-final.md,
+# Measured metrics of the shipped presets (measured in the upstream
 # gates 1/2/4 on an A10G-24G, torch 2.9.1).  They are *documentation*: the
 # exporter records them in meta.json and the model card, it does not recompute
-# them (see .tmp/export_agent/verify_standalone.py for the acceptance harness).
+# them; the acceptance harness lives in the upstream workspace).
 PRESET_METRICS: dict[str, dict] = {
     "w1": {
         "label": "default tier", "group_size": 32, "bf16_keeps": "v_proj (36 layers)",
@@ -127,7 +127,7 @@ PRESET_METRICS: dict[str, dict] = {
         "vram_peak_gib": 8.53, "runaway": "0/12",
     },
 }
-METRICS_SOURCE = (".tmp/reports/gptq-2-final.md §1 (gates 1/2/4; A10G-24G, "
+METRICS_SOURCE = ("gates 1/2/4; A10G-24G, "
                   "torch 2.9.1; speed floor 78 steps/s, VRAM ceiling 12 GiB)")
 
 # Fallback "cross-language validation" section (langcheck-1). A preset may
@@ -399,7 +399,7 @@ def export_standalone(model_dir: str, gptq_state_path: str, out_dir: str,
             "w1"); the CLI maps it to `--quant w4gptq` usage instructions.
         metrics: measured metrics to embed (default: PRESET_METRICS[preset]).
         hash_base: sha256 the base shards for provenance (~16.6 GiB read, cached
-            in .tmp/export_agent/base_hashes.json).
+            in the upstream workspace).
         template_path: model-card template (default `moss_tts_lite/README_hf.md`).
         dry_run: build the tensor inventory + meta but write nothing.
     """
@@ -923,7 +923,7 @@ def load_standalone_model(model_dir: str, device="cuda",
 
     Equivalent to the `base + <state>.pt` path (`MossTTSModel(base)` +
     `load_gptq_fast(model, state)`) down to the last bit; see
-    `.tmp/export_agent/verify_standalone.py`.
+    the upstream workspace.
     """
     dev = torch.device(device)
     meta, weights, state, gmap, keep = read_standalone(model_dir, expected_preset)

@@ -497,7 +497,7 @@ class MossCodecDecoder:
 class MossCodecStreamer:
     """Stateful incremental decoder aligned with reference streaming semantics.
 
-    Design (see .tmp/reports/codec-3-parity.md): ring KV-caches make the audio
+    Design: ring KV-caches make the audio
     for a code frame depend on the write schedule (write-count eviction), so a
     faithful incremental stream must feed the engine in fixed `chunk_frames`
     blocks. `push()` buffers incoming frames and emits wav exactly when a full

@@ -1,7 +1,7 @@
 """Native-operator fast decode for MOSS-TTS (whole-step CUDA graph, W4).
 
 Measured on an A10G-24G with the shipped w1p checkpoint, zh_plain, seed 1234,
-audio-phase step at a fixed cache length (`.tmp/native_agent/same_len.py`):
+audio-phase step at a fixed cache length:
 
     path                          ms/step   steps/s   text argmax  top-25 cover
     fast.py (38 sub-graphs)        12.23      81.7       100.00%      75.39%
@@ -198,7 +198,7 @@ class FastNativeTTS:
                 every length exactly once anyway, so the cap only bounds what
                 stays resident, and 64 covers a 5 s utterance before the first
                 re-capture.  Measured on the w1p path
-                (`.tmp/reports/kvfit-1.md` §3): 256 -> 64 changes neither the
+                (measured): 256 -> 64 changes neither the
                 per-step cost of the first capture-sweep nor the re-capture
                 cost once the cap is exceeded (both are the same
                 `_capture()`), it only lowers the resident pool.  Raise it

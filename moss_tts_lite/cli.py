@@ -72,27 +72,20 @@ MODEL_DIR = os.environ.get("MOSS_TTS_MODEL_DIR") or os.path.join(
 CODEC_DIR = os.environ.get("MOSS_TTS_CODEC_DIR") or os.path.join(
     os.path.dirname(__file__), "..", "models", "MOSS-Audio-Tokenizer")
 
-# ---- GPTQ states (offline artifacts; see .tmp/reports/gptq-2-final.md) -----
+# ---- GPTQ states (offline artifacts, ~4 GiB, not shipped in git) ----
 # Resolution order: --gptq-state > $MOSS_TTS_GPTQ_DIR > <model_dir>/gptq/.
-# The state file is *not* shipped in git (4 GiB); regenerate with
-#   python3 .tmp/gptq_agent/run_gptq.py --group-size 32 --damp 0.1 ...
-#   python3 .tmp/gptq_agent/merge_states.py --base ... --out <path>
+# Download the released standalone exports (HF/ModelScope, see README)
+# instead of regenerating; the quantization pipeline lives in the upstream
+# development workspace.
 GPTQ_PRESETS = {"w1": "w1.pt", "w1p": "w1p.pt", "w2": "w2.pt"}
 GPTQ_DEFAULT_PRESET = "w1p"
 GPTQ_REGEN_HINT = (
-    "regenerate it (GPU, ~35 min, needs .tmp/gptq_agent/calib/):\n"
-    "  python3 .tmp/gptq_agent/run_gptq.py --group-size 32 --damp 0.1 \\\n"
-    "      --scale-from compensated --inverse-device cpu --layers 0:17 --tag g32_a\n"
-    "  python3 .tmp/gptq_agent/run_gptq.py ... --layers 18:35 --tag g32_b\n"
-    "  python3 .tmp/gptq_agent/merge_states.py --union \\\n"
-    "      gptq_state_g32_a.pt,gptq_state_g32_b.pt --union-group 32 \\\n"
-    "      --out gptq_state_g32.pt\n"
-    "  python3 .tmp/gptq_agent/merge_states.py --base gptq_state_g32.pt \\\n"
-    "      --base-group 32 --bf16-linears <layers> --out <state path>") 
+    "download a standalone quantized export from HF/ModelScope (see README), "
+    "or re-run the GPTQ pipeline in the upstream development workspace")
 
 SR = 24000
 
-#: KV-cache sizing (see `.tmp/reports/kvfit-1.md`).
+#: KV-cache sizing.
 #: The delay state machine spends extra positions per utterance beyond
 #: `max_new_tokens`: after the last emitted audio row the 32-channel delay ramp
 #: still has to flush (`n_vq` steps), and the audio_end/ramp-out rows add a few
@@ -139,7 +132,7 @@ def _max_pause_s(text: str) -> float | None:
 
 
 # --------------------------------------------------------------------------- #
-# KV-cache sizing (kvfit).  See `.tmp/reports/kvfit-1.md`.                     #
+# KV-cache sizing (kvfit).  KV-cache sizing rationale (measured on A10G).       #
 # --------------------------------------------------------------------------- #
 def _kv_mib(n_seq: int) -> float:
     """KV bytes for `n_seq` positions: layers * 2 (K,V) * kv_heads * head_dim * bf16."""
@@ -307,7 +300,7 @@ def _pipeline(text: str, output: str, *, language, seed, greedy, max_new_tokens,
                      arm n2).  NOT bitwise: it swaps kernels (`F.rms_norm`, fused
                      int4 GEMMs, fused heads) to cut the step's kernel count, so
                      it decodes a different-but-valid utterance at ~97 steps/s
-                     on W4 (~81 for fast.py); see .tmp/reports/native-1.md.
+                     on W4 (~81 for fast.py); measured on A10G.
                      Incompatible with --greedy (the native loop samples).
     max_seq_len    : KV cache positions.  ``None`` (the CLI default) sizes it on
                      demand: the prompt is built first, L0 is known before the
@@ -502,7 +495,7 @@ def main(argv=None) -> int:
                         "known cache size (e.g. a server reusing one process)")
     p.add_argument("--max-graphs", type=int, default=None, metavar="N",
                    help="--fast-native's whole-step graph pool cap (default 64; "
-                        ".tmp/reports/kvfit-1.md). One graph per decoded cache "
+                        "One graph per decoded cache "
                         "length, ~6-7.5 MiB each; beyond the cap the oldest is "
                         "evicted and re-captured (~40-80 ms), so a one-shot CLI "
                         "call is unaffected (it captures every length once "
@@ -556,7 +549,7 @@ def main(argv=None) -> int:
                         "~78 steps/s, top-25 91.25%% [CUDA topk] / 99.30%% "
                         "[tie-robust], 0/12); 'w4gptq:w1p' = W1p (same shape and "
                         "speed class as W1, quantized against the ten-language "
-                        "calibration v3, see .tmp/reports/w1plus-1.md) - the "
+                        "calibration v3) - the "
                         "top-25 figure depends on the "
                         "tie convention, see README_ADVANCED.md; "
                         "'w4gptq:auto' = cached state if present, else fall "

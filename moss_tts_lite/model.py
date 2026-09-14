@@ -5,7 +5,7 @@ Checkpoint keys keep their original names (language_model.*, emb_ext.N.weight,
 lm_heads.N.weight).  Only torch is used.
 
 Numerics follow transformers' Qwen3 modeling code (verified against
-transformers 5.0 source; see .tmp/reports/):
+transformers 5.0 source):
 - RMSNorm: fp32 stats, cast back to input dtype, then scale by weight;
 - QK-norm: per-head RMSNorm over head_dim applied to q/k projections before rope;
 - rope (theta 1e6) applied to q/k only; cos/sin computed in fp32, cast to model dtype;
