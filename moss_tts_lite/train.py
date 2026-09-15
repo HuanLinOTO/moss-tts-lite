@@ -195,6 +195,20 @@ def resolve_device(device: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _detect_model_class(model_dir: str) -> tuple[bool, type]:
+    """Pick TrainableMossTTSLocal vs TrainableMossTTS from config.json."""
+    cfg_path = Path(model_dir) / "config.json"
+    is_local_arch = False
+    if cfg_path.exists():
+        try:
+            is_local_arch = json.loads(
+                cfg_path.read_text("utf-8")).get("model_type") == "moss_tts_local"
+        except json.JSONDecodeError:
+            pass
+    model_cls = TrainableMossTTSLocal if is_local_arch else TrainableMossTTS
+    return is_local_arch, model_cls
+
+
 def copy_assets(model_dir: str, output_dir: Path) -> list[str]:
     copied = []
     for name in ASSET_FILES:
@@ -552,15 +566,7 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
                    if (args.mode == "qlora" and device.type == "cuda") else device)
     print(f"[{_ts()}] loading base model from {args.model_dir} "
           f"(device={load_device}, dtype={dtype})")
-    cfg_path = Path(args.model_dir) / "config.json"
-    is_local_arch = False
-    if cfg_path.exists():
-        try:
-            is_local_arch = json.loads(
-                cfg_path.read_text("utf-8")).get("model_type") == "moss_tts_local"
-        except json.JSONDecodeError:
-            pass
-    model_cls = TrainableMossTTSLocal if is_local_arch else TrainableMossTTS
+    is_local_arch, model_cls = _detect_model_class(args.model_dir)
     print(f"[{_ts()}] architecture: "
           f"{'local-transformer (n_vq=12, 48kHz v2)' if is_local_arch else 'delay (v1)'}")
     model = model_cls.from_pretrained(args.model_dir, dtype=dtype,
@@ -742,10 +748,12 @@ def cmd_merge(args: argparse.Namespace) -> dict[str, Any]:
         else torch.float32
     qlora_on_cuda = qlora_exact and device.type == "cuda"
     load_device = torch.device("cpu") if qlora_on_cuda else device
+    is_local_arch, model_cls = _detect_model_class(args.model_dir)
     print(f"[{_ts()}] loading base model from {args.model_dir} "
-          f"(device={load_device}, dtype={compute_dtype}, qlora_exact_base={qlora_exact})")
-    model = TrainableMossTTS.from_pretrained(args.model_dir, dtype=compute_dtype,
-                                             device=load_device)
+          f"(device={load_device}, dtype={compute_dtype}, qlora_exact_base={qlora_exact}, "
+          f"arch={'local-transformer' if is_local_arch else 'delay'})")
+    model = model_cls.from_pretrained(args.model_dir, dtype=compute_dtype,
+                                      device=load_device)
     if qlora_exact:
         if not qlora_on_cuda:
             print(f"[{_ts()}] WARNING: qlora-exact-base needs CUDA+bitsandbytes; "
