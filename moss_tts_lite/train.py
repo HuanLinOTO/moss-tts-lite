@@ -165,11 +165,25 @@ def load_tokenizer(model_dir: str) -> QwenBPE:
     tok_json = d / "tokenizer.json"
     added = str(tok_json) if tok_json.exists() else str(d / "added_tokens.json")
     tok = QwenBPE(str(d / "vocab.json"), str(d / "merges.txt"), added)
-    for token, want in (("<|im_start|>", 151644), ("<|im_end|>", 151645),
-                        ("<|audio_start|>", 151652), ("<|audio_end|>", 151653),
-                        ("<|audio_user_slot|>", 151654),
-                        ("<|audio_assistant_gen_slot|>", 151656),
-                        ("<|audio_assistant_delay_slot|>", 151662)):
+    # v1 (ModelScope) and v2 (HF) assign different ids to audio_start/end;
+    # prefer the model's config.json, fall back to the v1 defaults.
+    cfg = {}
+    cfg_path = d / "config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    for token, cfg_key, default in (
+            ("<|im_start|>", "im_start_token_id", 151644),
+            ("<|im_end|>", "im_end_token_id", 151645),
+            ("<|audio_start|>", "audio_start_token_id", 151652),
+            ("<|audio_end|>", "audio_end_token_id", 151653),
+            ("<|audio_user_slot|>", "audio_user_slot_token_id", 151654),
+            ("<|audio_assistant_gen_slot|>", "audio_assistant_gen_slot_token_id",
+             151656),
+            ("<|audio_assistant_delay_slot|>", None, 151662)):
+        want = int(cfg.get(cfg_key, default)) if cfg_key else default
         got = tok.encode(token)
         if got != [want]:
             raise ValueError(f"tokenizer in {model_dir} maps {token!r} to {got}, "

@@ -17,8 +17,8 @@ import torch
 from torch.utils.data import Dataset
 
 from .bpe import QwenBPE
-from .model import (AUDIO_DELAY_SLOT_TOKEN_ID, AUDIO_END_TOKEN_ID,
-                    AUDIO_GEN_SLOT_TOKEN_ID, AUDIO_PAD_CODE, AUDIO_START_TOKEN_ID,
+from .model import (AUDIO_DELAY_SLOT_TOKEN_ID,
+                    AUDIO_GEN_SLOT_TOKEN_ID, AUDIO_PAD_CODE,
                     AUDIO_USER_SLOT_TOKEN_ID, N_VQ, PAD_TOKEN_ID)
 from .normalizer import normalize_tts_text
 from .prompt import _render_user_inst, apply_delay_pattern
@@ -35,6 +35,24 @@ AUDIO_END_TOKEN = "<|audio_end|>"
 
 USER_MESSAGE_KEYS = ("text", "instruction", "tokens", "quality",
                      "sound_event", "ambient_sound", "language")
+
+_TOKEN_IDS_CACHE: dict[int, tuple[int, int]] = {}
+
+
+def _audio_boundary_ids(tokenizer) -> tuple[int, int]:
+    """Resolve <|audio_start|>/<|audio_end|> ids from the tokenizer itself.
+
+    v1 (ModelScope) and v2 (HF local-transformer) checkpoints assign different
+    ids to these tokens (151652/151653 vs 151669/151670), so the constants in
+    model.py only describe the v1 generation.
+    """
+    key = id(tokenizer)
+    cached = _TOKEN_IDS_CACHE.get(key)
+    if cached is None:
+        cached = (tokenizer.encode(AUDIO_START_TOKEN)[0],
+                  tokenizer.encode(AUDIO_END_TOKEN)[0])
+        _TOKEN_IDS_CACHE[key] = cached
+    return cached
 
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -128,8 +146,9 @@ def get_unified_codes(role: str, content: str, audio_codes_list: list[torch.Tens
         n_vq, gen_token, delay_token)
     text_codes = torch.tensor(tokenizer.encode(content), dtype=torch.long)
 
-    audio_start_indices = torch.where(text_codes == AUDIO_START_TOKEN_ID)[0]
-    audio_end_indices = torch.where(text_codes == AUDIO_END_TOKEN_ID)[0]
+    audio_start_id, audio_end_id = _audio_boundary_ids(tokenizer)
+    audio_start_indices = torch.where(text_codes == audio_start_id)[0]
+    audio_end_indices = torch.where(text_codes == audio_end_id)[0]
     if (len(audio_start_indices) != len(audio_codes_list)
             or len(audio_end_indices) != len(audio_codes_list)):
         raise ValueError("Audio placeholders do not match the provided audio codes list.")
