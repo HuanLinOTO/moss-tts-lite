@@ -329,15 +329,22 @@ def _multi_head_ce_loss(
 
     n_vq = audio_logits.size(2)
     audio_vocab = audio_logits.size(-1)
+    # audio_logits [B, T, C, V] is contiguous: plain reshape is zero-copy
+    # (a permute-based version forced an extra bf16 contiguous copy, which
+    # pushed peak activation memory over the edge on 24GB cards).
+    # CE rows are independent, so the (B*T*C) row set matches the per-head
+    # loop exactly. The per-sample T-sum is mathematically identical; fp32
+    # addition order may differ from the loop by ~1e-6 (strided reduction).
     audio_per_token = F.cross_entropy(
-        audio_logits.permute(0, 2, 1, 3).reshape(-1, audio_vocab).float(),
-        labels[..., 1:].permute(0, 2, 1).contiguous().view(-1),
+        audio_logits.reshape(-1, audio_vocab).float(),
+        labels[..., 1:].contiguous().view(-1),
         reduction="none",
-    ).view(bsz, n_vq, -1)                                            # [B, C, T]
+    ).view(bsz, -1, n_vq)                                            # [B, T, C]
+    audio_sums = audio_per_token.sum(dim=1)                          # [B, C-1]
 
     all_sum_losses = torch.cat(
         [text_per_token.sum(dim=-1, keepdim=True),
-         audio_per_token.sum(dim=-1)], dim=1)                        # [B, C]
+         audio_sums], dim=1)                                         # [B, C]
 
     if channelwise_loss_weight is not None:
         if len(channelwise_loss_weight) != n_heads:
