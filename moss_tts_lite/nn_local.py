@@ -34,12 +34,18 @@ class LocalConfig:
     n_layer: int = 1
     hidden_size: int = 2560
     n_head: int = 32
+    n_inner: int = 0  # 0 -> 4 * hidden_size (GPT-2 default)
+    activation: str = "gelu_new"  # or "silu" (official v1.5 uses silu)
     layer_norm_eps: float = 1e-5
     rope_base: float = 10000.0
 
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.n_head
+
+    @property
+    def inner_size(self) -> int:
+        return self.n_inner if self.n_inner > 0 else 4 * self.hidden_size
 
 
 def _gelu_new(x: torch.Tensor) -> torch.Tensor:
@@ -98,11 +104,12 @@ class NanoGPT2Attention(nn.Module):
 class NanoGPT2MLP(nn.Module):
     def __init__(self, cfg: LocalConfig):
         super().__init__()
-        self.fc_in = nn.Linear(cfg.hidden_size, 4 * cfg.hidden_size)
-        self.fc_out = nn.Linear(4 * cfg.hidden_size, cfg.hidden_size)
+        self.fc_in = nn.Linear(cfg.hidden_size, cfg.inner_size)
+        self.fc_out = nn.Linear(cfg.inner_size, cfg.hidden_size)
+        self._act = (F.silu if cfg.activation == "silu" else _gelu_new)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc_out(_gelu_new(self.fc_in(x)))
+        return self.fc_out(self._act(self.fc_in(x)))
 
 
 class NanoGPT2Block(nn.Module):
@@ -196,6 +203,8 @@ class TrainableMossTTSLocal(nn.Module):
             n_layer=int(g2.get("n_layer", 1)),
             hidden_size=int(g2.get("n_embd", cfg.hidden_size)),
             n_head=int(g2.get("n_head", cfg.n_heads)),
+            n_inner=int(g2.get("n_inner", 0)),
+            activation=str(g2.get("activation_function", "gelu_new")),
             layer_norm_eps=float(g2.get("layer_norm_epsilon", 1e-5)),
             rope_base=float(g2.get("rope_base", 10000.0)),
         )
