@@ -299,6 +299,11 @@ def export_model_dir(model: torch.nn.Module, model_dir: str, output_dir: Path,
              for k, v in model.state_dict().items()}
     written = write_safetensors(state, output_dir)
     copy_assets(model_dir, output_dir)
+    # trust_remote_code architectures also need their modeling .py files,
+    # which ASSET_FILES (v1 asset names) does not cover.
+    for src in Path(model_dir).iterdir():
+        if src.suffix in (".py", ".jinja") and src.is_file():
+            shutil.copy2(src, output_dir / src.name)
     return written
 
 
