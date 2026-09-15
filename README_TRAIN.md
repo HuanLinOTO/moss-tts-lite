@@ -160,7 +160,11 @@ v2 序列短(1705 条数据 p50=149 / p95=233 / max=426 token),token 预算可�
 | bs4 + mbt900 (rank32) | 11.2 | 12.6 GB |
 | bs8 + mbt900 (rank64) | ~16 | 13.3 GB |
 | bs8 + mbt1200 (rank64) | OOM(差 1.7GB) | - |
+| bs8/bs16 + mbt2400 独占卡 | OOM | >24GB |
+| bs16 + mbt1200 独占卡 | 5.1 | 15.9 GB |
 
+结论: v2 短序列(p50=149)下 **bs8+mbt900 是甜点**; 更大 token 预算反被
+激活/带宽压力反噬(mbt1200 独占反而慢 3x)。
 注: torch.compile(dynamic=True) 在 NF4+peft 下实测负优化(1.9 vs 2.8 steps/s,
 bnb4bit graph break + 动态 shape 重编译),保持默认关闭。merge 子命令同样
 自动识别 v2 底座。
