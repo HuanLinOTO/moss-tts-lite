@@ -552,7 +552,15 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit("No records left after --max-audio-frames filtering.")
 
     tokenizer = load_tokenizer(args.model_dir)
-    dataset = MossTTSTrainDataset(records, tokenizer)
+    # v2 (local-transformer): slots reuse Qwen vision/video-pad ids; pass
+    # them so the dataset builds one-slot-per-frame sequences.
+    local_slot_ids = None
+    if _detect_model_class(args.model_dir)[0]:
+        raw_cfg = json.loads((Path(args.model_dir) / "config.json")
+                              .read_text(encoding="utf-8"))
+        local_slot_ids = (int(raw_cfg["audio_user_slot_token_id"]),
+                          int(raw_cfg["audio_assistant_slot_token_id"]))
+    dataset = MossTTSTrainDataset(records, tokenizer, slot_ids=local_slot_ids)
     batch_sampler = None
     if args.max_batch_tokens and args.max_batch_tokens > 0:
         lengths = [int(dataset.pack_record(r)["input_ids"].shape[0])

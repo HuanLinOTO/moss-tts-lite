@@ -113,6 +113,19 @@ def build_assistant_message(audio_codes_list, content: str = AUDIO_PLACEHOLDER) 
 # Unified codes (`_get_unified_codes`)
 # ---------------------------------------------------------------------------
 
+def _replace_audio_placeholders_local(content: str, lengths: Sequence[int],
+                                      slot_token: str) -> str:
+    """v2 (local-transformer): one slot token per frame, no delay expansion."""
+    def build_audio_block(length: int) -> str:
+        if length == 0:
+            return f"{AUDIO_START_TOKEN}{AUDIO_END_TOKEN}"
+        return f"{AUDIO_START_TOKEN}{slot_token * length}{AUDIO_END_TOKEN}"
+
+    lengths_iter = iter(lengths)
+    return re.sub(re.escape(AUDIO_PLACEHOLDER),
+                  lambda _m: build_audio_block(next(lengths_iter)), content)
+
+
 def _replace_audio_placeholders(content: str, lengths: Sequence[int], n_vq: int,
                                 gen_slot_token: str, delay_slot_token: str) -> str:
     num_placeholders = content.count(AUDIO_PLACEHOLDER)
@@ -133,17 +146,34 @@ def _replace_audio_placeholders(content: str, lengths: Sequence[int], n_vq: int,
 
 
 def get_unified_codes(role: str, content: str, audio_codes_list: list[torch.Tensor],
-                      tokenizer, n_vq: int) -> torch.Tensor:
-    """One message -> unified codes [T, n_vq + 1] (text channel first)."""
-    if role == "user":
-        gen_token = delay_token = USER_SLOT_TOKEN
-    else:
-        gen_token = GEN_SLOT_TOKEN
-        delay_token = DELAY_SLOT_TOKEN
+                      tokenizer, n_vq: int,
+                      slot_ids: Optional[tuple[int, int]] = None) -> torch.Tensor:
+    """One message -> unified codes [T, n_vq + 1] (text channel first).
 
-    content = _replace_audio_placeholders(
-        content, [int(codes.shape[0]) for codes in audio_codes_list],
-        n_vq, gen_token, delay_token)
+    slot_ids: (user_slot_id, assistant_slot_id) from a v2 (local-transformer)
+    config.json -> one slot position per frame, codes aligned directly (no
+    delay-pattern expansion). None -> v1 delay layout with dedicated slot
+    token strings.
+    """
+    if slot_ids is not None:
+        user_slot_id, asst_slot_id = slot_ids
+        slot_id = user_slot_id if role == "user" else asst_slot_id
+        slot_token = tokenizer.id_to_added_token(slot_id)
+        if slot_token is None:
+            raise ValueError(
+                f"slot id {slot_id} is not an added token in this tokenizer")
+        content = _replace_audio_placeholders_local(
+            content, [int(codes.shape[0]) for codes in audio_codes_list],
+            slot_token)
+    else:
+        if role == "user":
+            gen_token = delay_token = USER_SLOT_TOKEN
+        else:
+            gen_token = GEN_SLOT_TOKEN
+            delay_token = DELAY_SLOT_TOKEN
+        content = _replace_audio_placeholders(
+            content, [int(codes.shape[0]) for codes in audio_codes_list],
+            n_vq, gen_token, delay_token)
     text_codes = torch.tensor(tokenizer.encode(content), dtype=torch.long)
 
     audio_start_id, audio_end_id = _audio_boundary_ids(tokenizer)
@@ -161,10 +191,14 @@ def get_unified_codes(role: str, content: str, audio_codes_list: list[torch.Tens
         prefix_idx = 0
         for audio_start_idx, audio_end_idx, audio_codes in zip(
                 audio_start_indices, audio_end_indices, audio_codes_list):
-            delay_audio_codes = apply_delay_pattern(audio_codes, AUDIO_PAD_CODE)
+            if slot_ids is not None:
+                # v2 local-transformer: frame codes align 1:1 with the slot rows.
+                aligned_codes = audio_codes.to(torch.long)
+            else:
+                aligned_codes = apply_delay_pattern(audio_codes, AUDIO_PAD_CODE)
             pad_codes = torch.full((int(audio_start_idx) - prefix_idx + 1, n_vq),
                                    AUDIO_PAD_CODE, dtype=torch.long)
-            segments.extend([pad_codes, delay_audio_codes])
+            segments.extend([pad_codes, aligned_codes])
             prefix_idx = int(audio_end_idx)
         pad_codes = torch.full((len(text_codes) - prefix_idx, n_vq), AUDIO_PAD_CODE,
                                dtype=torch.long)
@@ -178,13 +212,15 @@ def get_unified_codes(role: str, content: str, audio_codes_list: list[torch.Tens
 
 
 def _message_to_unified(message: dict, tokenizer, n_vq: int,
-                        add_generation_prompt: bool) -> torch.Tensor:
+                        add_generation_prompt: bool,
+                        slot_ids: Optional[tuple[int, int]] = None) -> torch.Tensor:
     """apply_chat_template for a single message, then `_get_unified_codes`."""
     role = message["role"]
     content = (f"<|im_start|>{role}\n{message['content']}<|im_end|>\n")
     if add_generation_prompt:
         content += "<|im_start|>assistant\n"
-    return get_unified_codes(role, content, message["audio_codes_list"], tokenizer, n_vq)
+    return get_unified_codes(role, content, message["audio_codes_list"], tokenizer,
+                             n_vq, slot_ids=slot_ids)
 
 
 def _user_message_for_record(record: dict, target_n_vq: int) -> dict:
@@ -195,23 +231,28 @@ def _user_message_for_record(record: dict, target_n_vq: int) -> dict:
 
 def build_generation_prompt_ids(record: dict, tokenizer,
                                 n_vq: Optional[int] = None,
-                                user_message: Optional[dict] = None) -> torch.Tensor:
+                                user_message: Optional[dict] = None,
+                                 slot_ids: Optional[tuple[int, int]] = None) -> torch.Tensor:
     """User message (+ generation prompt) -> [T, n_vq+1]; T is the loss prompt length."""
     n_vq = n_vq or _record_n_vq(record)
     user = user_message if user_message is not None else _user_message_for_record(record, n_vq)
-    return _message_to_unified(user, tokenizer, n_vq, add_generation_prompt=True)
+    return _message_to_unified(user, tokenizer, n_vq, add_generation_prompt=True,
+                               slot_ids=slot_ids)
 
 
 def build_computing_loss_ids(record: dict, tokenizer, n_vq: Optional[int] = None,
-                              user_message: Optional[dict] = None) -> torch.Tensor:
+                              user_message: Optional[dict] = None,
+                              slot_ids: Optional[tuple[int, int]] = None) -> torch.Tensor:
     """[user, assistant] conversation in computing_loss mode -> [T, n_vq+1]."""
     n_vq = n_vq or _record_n_vq(record)
     user = user_message if user_message is not None else _user_message_for_record(record, n_vq)
     assistant = build_assistant_message(
         [normalize_audio_codes(record["audio_codes"], "audio_codes")])
     unified = torch.cat([
-        _message_to_unified(user, tokenizer, n_vq, add_generation_prompt=False),
-        _message_to_unified(assistant, tokenizer, n_vq, add_generation_prompt=False),
+        _message_to_unified(user, tokenizer, n_vq, add_generation_prompt=False,
+                            slot_ids=slot_ids),
+        _message_to_unified(assistant, tokenizer, n_vq, add_generation_prompt=False,
+                            slot_ids=slot_ids),
     ])
     return unified
 
@@ -308,10 +349,12 @@ class MossTTSTrainDataset(Dataset):
     """Records (official prepare_data JSONL format) -> teacher-forcing batches."""
 
     def __init__(self, records: Sequence[dict[str, Any]], tokenizer,
-                 n_vq: Optional[int] = None):
+                 n_vq: Optional[int] = None,
+                 slot_ids: Optional[tuple[int, int]] = None):
         self.records = list(records)
         self.tokenizer = tokenizer
         self.n_vq = n_vq
+        self.slot_ids = slot_ids
 
     def __len__(self) -> int:
         return len(self.records)
@@ -335,11 +378,13 @@ class MossTTSTrainDataset(Dataset):
         # like the official dataset (processor mode="generation").
         prompt_user = build_user_message(**user_kwargs)
         prompt_ids = _message_to_unified(prompt_user, self.tokenizer, target_n_vq,
-                                         add_generation_prompt=True)
+                                         add_generation_prompt=True,
+                                         slot_ids=self.slot_ids)
         prompt_length = int(prompt_ids.shape[0])
 
         full_input_ids = build_computing_loss_ids(
-            record, self.tokenizer, target_n_vq, user_message=prompt_user)
+            record, self.tokenizer, target_n_vq, user_message=prompt_user,
+            slot_ids=self.slot_ids)
         if prompt_length >= full_input_ids.shape[0]:
             raise ValueError("Prompt length must be shorter than the packed "
                              "teacher-forcing sequence.")
