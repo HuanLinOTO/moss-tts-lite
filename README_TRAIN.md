@@ -69,42 +69,15 @@ python -m moss_tts_lite.train \
     --model-dir /path/to/MOSS-TTS-v1.5 \
     --train-jsonl data/nahida_train.jsonl \
     --output-dir runs/nahida-qlora \
-    --mode qlora --bf16 --gradient-checkpointing \
+    --mode qlora --bf16 \
     --lora-rank 32 --lora-alpha 64 \
-    --per-device-batch-size 1 --gradient-accumulation-steps 4 \
+    --per-device-batch-size 8 --max-batch-tokens 1200 \
+    --num-workers 4 --fused-optimizer \
     --learning-rate 1e-4 --num-epochs 3 \
     --channelwise-loss-weight 1,32 \
     --max-audio-frames 3000 --seed 42 \
     --merge-and-export
 ```
-
-
-### 3.1 吞吐调优（变长音频数据必读）
-
-语音样本长度差异大（本数据集 p50≈180 / p95≈264 / max≈457 token）。**固定
-batch 随机组批**会造成：padding 计算浪费 + 最坏 batch 显存失控（24GB 卡上
-bs4 随机组批会 OOM）。两个正交手段：
-
-1. **--max-batch-tokens（token-budget batching）**：按长度分桶组批，
-   保证 padded max_len × bs ≤ 预算——短句自动满批、长句自动小批，
-   消灭 padding 浪费与 OOM。--per-device-batch-size 作为批大小上限。
-2. **--gradient-checkpointing**：激活显存大幅下降，换来反向重算 ~30% 开销，
-   但允许把 token 预算开得更大，通常**净赚**。
-3. --num-workers 4 --fused-optimizer：免费小补。
-
-4090-24G 实测（纳西妲 1705 条 / 3.04h，40 步取后 30 步均值）：
-
-| 配置 | samples/s | 相对基线 | 峰值显存 | SM | 功耗 |
-|---|---|---|---|---|---|
-| bs1×ga4（旧默认） | 3.0 | 1.0× | 13.0 GB | ~42% | ~92 W |
-| bs4 + mbt6000 | 10.2 | 3.4× | 20.5 GB | ~38% | ~76 W |
-| bs8 + mbt1200 | 13.0 | 4.3× | 21.9 GB | ~45% | ~150 W |
-| gc + bs8 + mbt2400 | （补充中） | — | 8.9 GB | — | — |
-
-推荐起步：--per-device-batch-size 8 --max-batch-tokens 2400
---gradient-checkpointing --num-workers 4 --fused-optimizer，
-显存富余时优先加预算、再加 bs 上限。瓶颈是 per-step Python/launch
-开销（peft 包装层 ~400 次调用/步），batch 越大摊得越薄。
 
 - `--mode full`：全参 SFT（默认 lr 1e-5；显存 ≥ 2×模型 bf16 + 优化器态，4090 24G 只够小改）。
 - `--mode lora`：纯 peft LoRA 不量化（CPU 也能跑，适合冒烟）。
@@ -118,7 +91,34 @@ bs4 随机组批会 OOM）。两个正交手段：
 
 **QLoRA 说明**：语言主干线性层量化为 NF4（bnb_4bit_use_double_quant），
 embeddings/lm_heads 保持 bf16（与 transformers QLoRA 默认跳过 lm_head 的布局一致）。
-模型先以 bf16 加载到 CUDA，再量化包装。
+模型先以 bf16 加载到 CPU，再逐层量化上卡（24GB 卡友好）。
+
+### 3.1 吞吐调优（变长音频数据必读）
+
+语音样本长度差异大（本数据集 p50≈180 / p95≈264 / max≈457 token）。**固定
+batch 随机组批**会造成：padding 计算浪费 + 最坏 batch 显存失控（24GB 卡上
+bs4 随机组批会 OOM）。三个正交手段：
+
+1. **--max-batch-tokens（token-budget batching）**：按长度分桶组批，
+   保证 padded max_len × bs ≤ 预算——短句自动满批、长句自动小批，
+   消灭 padding 浪费与 OOM。--per-device-batch-size 作为批大小上限。
+2. **--gradient-checkpointing**：激活显存大幅下降，换来反向重算 ~30% 开销，
+   但允许把 token 预算开得更大（gc+mbt2400 峰值实测仅 8.9 GB）。
+3. --num-workers 4 --fused-optimizer：免费小补。
+
+4090-24G 实测（纳西妲 1705 条 / 3.04h，40 步取后 30 步均值）：
+
+| 配置 | samples/s | 相对基线 | 峰值显存 | SM | 功耗 |
+|---|---|---|---|---|---|
+| bs1×ga4（旧默认） | 3.0 | 1.0× | 13.0 GB | ~42% | ~92 W |
+| bs4 + mbt6000 | 10.2 | 3.4× | 20.5 GB | ~38% | ~76 W |
+| bs8 + mbt1200 | 13.0 | 4.3× | 21.9 GB | ~45% | ~150 W |
+| gc + bs8 + mbt2400 | 待独占卡复测 | — | 8.9 GB | — | — |
+
+推荐起步：--per-device-batch-size 8 --max-batch-tokens 1200 --num-workers 4
+--fused-optimizer；显存富余优先加预算、再加 bs 上限，紧张则加 gc。
+瓶颈是 per-step Python/launch 开销（peft 包装层 ~400 次调用/步），
+batch 越大摊得越薄。
 
 ## 4. 合并导出：merge（独立入口）
 
