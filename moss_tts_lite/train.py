@@ -174,20 +174,25 @@ def load_tokenizer(model_dir: str) -> QwenBPE:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             pass
-    for token, cfg_key, default in (
-            ("<|im_start|>", "im_start_token_id", 151644),
-            ("<|im_end|>", "im_end_token_id", 151645),
-            ("<|audio_start|>", "audio_start_token_id", 151652),
-            ("<|audio_end|>", "audio_end_token_id", 151653),
-            ("<|audio_user_slot|>", "audio_user_slot_token_id", 151654),
+    for token, cfg_key, default, is_slot in (
+            ("<|im_start|>", "im_start_token_id", 151644, False),
+            ("<|im_end|>", "im_end_token_id", 151645, False),
+            ("<|audio_start|>", "audio_start_token_id", 151652, False),
+            ("<|audio_end|>", "audio_end_token_id", 151653, False),
+            ("<|audio_user_slot|>", "audio_user_slot_token_id", 151654, True),
             ("<|audio_assistant_gen_slot|>", "audio_assistant_gen_slot_token_id",
-             151656),
-            ("<|audio_assistant_delay_slot|>", None, 151662)):
+             151656, True),
+            ("<|audio_assistant_delay_slot|>", None, 151662, True)):
         want = int(cfg.get(cfg_key, default)) if cfg_key else default
         got = tok.encode(token)
-        if got != [want]:
-            raise ValueError(f"tokenizer in {model_dir} maps {token!r} to {got}, "
-                             f"expected [{want}]")
+        if got == [want]:
+            continue
+        if is_slot and tok.id_to_added_token(want) is not None:
+            # v2 (local-transformer) tokenizers have no dedicated slot strings;
+            # slots reuse the vision/video-pad tokens and are injected by id.
+            continue
+        raise ValueError(f"tokenizer in {model_dir} maps {token!r} to {got}, "
+                         f"expected [{want}]")
     return tok
 
 
