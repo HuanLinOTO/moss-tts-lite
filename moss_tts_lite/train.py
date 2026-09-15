@@ -103,6 +103,12 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help="After training, merge LoRA and export a lite-CLI-ready "
                         "model dir (output-dir/merged).")
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--max-batch-tokens", type=int, default=0,
+                   help="Token-budget batching: group similar-length records so "
+                        "padded max_len*bs stays <= budget (long clips get "
+                        "smaller batches). 0 = fixed --per-device-batch-size.")
+    p.add_argument("--fused-optimizer", action="store_true",
+                   help="Fused AdamW optimizer step (CUDA only).")
     return p
 
 
@@ -409,11 +415,64 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, name: str,
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+class TokenBudgetBatchSampler:
+    """Length-grouped, token-budget batch sampler for variable-length records.
+
+    Keeps padding waste low (similar lengths share a batch) and caps the
+    worst-case padded batch (max_len * bs <= max_tokens), so bigger
+    --per-device-batch-size no longer risks OOM on long clips. Re-shuffles
+    every epoch; batch order is shuffled too.
+    """
+
+    def __init__(self, lengths: list[int], batch_size: int, max_tokens: int,
+                 seed: int = 0):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.max_tokens = max_tokens
+        self.seed = seed
+        self.epoch = 0
+
+    def _compose(self) -> list[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        idx = list(range(len(self.lengths)))
+        rng.shuffle(idx)
+        # Stable sort keeps the random order within equal lengths.
+        idx.sort(key=lambda i: self.lengths[i])
+        batches: list[list[int]] = []
+        cur: list[int] = []
+        cur_max = 0
+        for i in idx:
+            n = self.lengths[i]
+            new_max = max(cur_max, n)
+            if cur and (len(cur) + 1 > self.batch_size
+                        or new_max * (len(cur) + 1) > self.max_tokens):
+                batches.append(cur)
+                cur, cur_max = [i], n
+            else:
+                cur.append(i)
+                cur_max = new_max
+        if cur:
+            batches.append(cur)
+        rng.shuffle(batches)
+        return batches
+
+    def __iter__(self):
+        batches = self._compose()
+        self.epoch += 1
+        return iter(batches)
+
+    def __len__(self) -> int:
+        return len(self._compose())
+
+
 # ---------------------------------------------------------------------------
 # train
 # ---------------------------------------------------------------------------
 
 def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
+    # Fragmentation-resistant allocation for variable-length batches; must be
+    # set before the first CUDA allocation.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     device = resolve_device(args.device)
@@ -452,10 +511,30 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
 
     tokenizer = load_tokenizer(args.model_dir)
     dataset = MossTTSTrainDataset(records, tokenizer)
-    loader = DataLoader(
-        dataset, batch_size=args.per_device_batch_size, shuffle=True,
+    batch_sampler = None
+    if args.max_batch_tokens and args.max_batch_tokens > 0:
+        lengths = [int(dataset.pack_record(r)["input_ids"].shape[0])
+                   for r in records]
+        batch_sampler = TokenBudgetBatchSampler(
+            lengths, args.per_device_batch_size, args.max_batch_tokens,
+            seed=args.seed)
+        srt = sorted(lengths)
+        print(f"[{_ts()}] token-budget batching: budget={args.max_batch_tokens} "
+              f"max_bs={args.per_device_batch_size} "
+              f"batches/epoch={len(batch_sampler)} "
+              f"len p50={srt[len(srt) // 2]} p95={srt[min(len(srt) - 1, int(len(srt) * 0.95))]} "
+              f"max={srt[-1]}")
+    loader_kwargs = dict(
         collate_fn=dataset.collate_fn, num_workers=args.num_workers,
-        generator=torch.Generator().manual_seed(args.seed))
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0)
+    if batch_sampler is not None:
+        loader = DataLoader(dataset, batch_sampler=batch_sampler, **loader_kwargs)
+    else:
+        loader = DataLoader(dataset, batch_size=args.per_device_batch_size,
+                            shuffle=True,
+                            generator=torch.Generator().manual_seed(args.seed),
+                            **loader_kwargs)
 
     # QLoRA: load on CPU first, then quantize linears onto the GPU one at a
     # time — avoids ever holding a full bf16 copy + NF4 copy on a 24GB card.
@@ -489,9 +568,12 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable, lr=lr, weight_decay=args.weight_decay,
-                      betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+                      betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps,
+                      fused=args.fused_optimizer and device.type == "cuda")
 
-    micro_batches_per_epoch = math.ceil(len(dataset) / args.per_device_batch_size)
+    micro_batches_per_epoch = (
+        len(batch_sampler) if batch_sampler is not None
+        else math.ceil(len(dataset) / args.per_device_batch_size))
     update_steps_per_epoch = math.ceil(micro_batches_per_epoch
                                        / args.gradient_accumulation_steps)
     max_train_steps = args.max_steps or args.num_epochs * update_steps_per_epoch
@@ -530,11 +612,47 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         with open(step_dir / "train_args.json", "w", encoding="utf-8") as f:
             json.dump(train_args, f, indent=2, ensure_ascii=False)
 
+    def _optimizer_step(micro_loss: float, epoch: int) -> bool:
+        """Run one optimizer update. Returns True when max_train_steps is hit."""
+        nonlocal global_step, last_log, last_logged_step
+        if args.max_grad_norm and args.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        global_step += 1
+        losses.append(micro_loss * args.gradient_accumulation_steps)
+
+        now = time.perf_counter()
+        if global_step % args.logging_steps == 0:
+            steps_per_sec = max(global_step - last_logged_step, 1) / (now - last_log)
+            eta = (max_train_steps - global_step) / steps_per_sec
+            mem = (torch.cuda.max_memory_allocated() / 2**30
+                   if device.type == "cuda" else 0.0)
+            print(f"[{_ts()}] epoch={epoch} step={global_step}/{max_train_steps} "
+                  f"loss={losses[-1]:.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                  f"steps_per_sec={steps_per_sec:.3f} "
+                  f"eta={_fmt_duration(eta)} peak_mem={mem:.2f}GiB",
+                  flush=True)
+            last_log = now
+            last_logged_step = global_step
+
+        if args.save_steps and global_step % args.save_steps == 0:
+            if args.mode in ("lora", "qlora"):
+                _save_adapter(output_dir / f"checkpoint-{global_step}")
+            else:
+                export_model_dir(model, args.model_dir,
+                                 output_dir / f"checkpoint-{global_step}",
+                                 dtype=dtype)
+
+        return global_step >= max_train_steps
+
     for epoch in range(args.num_epochs):
         if done:
             break
         for it, batch in enumerate(loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {k: v.to(device, non_blocking=True)
+                     for k, v in batch.items()}
             out = model(input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         labels=batch["labels"],
@@ -542,40 +660,17 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
             loss = out.loss / args.gradient_accumulation_steps
             loss.backward()
 
-            if (it + 1) % args.gradient_accumulation_steps == 0 or                     it + 1 == micro_batches_per_epoch:
-                if args.max_grad_norm and args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                losses.append(float(loss.detach()) * args.gradient_accumulation_steps)
-
-                now = time.perf_counter()
-                if global_step % args.logging_steps == 0:
-                    steps_per_sec = max(global_step - last_logged_step, 1) / (now - last_log)
-                    eta = (max_train_steps - global_step) / steps_per_sec
-                    mem = (torch.cuda.max_memory_allocated() / 2**30
-                           if device.type == "cuda" else 0.0)
-                    print(f"[{_ts()}] epoch={epoch} step={global_step}/{max_train_steps} "
-                          f"loss={losses[-1]:.4f} lr={scheduler.get_last_lr()[0]:.2e} "
-                          f"steps_per_sec={steps_per_sec:.3f} "
-                          f"eta={_fmt_duration(eta)} peak_mem={mem:.2f}GiB",
-                          flush=True)
-                    last_log = now
-                    last_logged_step = global_step
-
-                if args.save_steps and global_step % args.save_steps == 0:
-                    if args.mode in ("lora", "qlora"):
-                        _save_adapter(output_dir / f"checkpoint-{global_step}")
-                    else:
-                        export_model_dir(model, args.model_dir,
-                                         output_dir / f"checkpoint-{global_step}",
-                                         dtype=dtype)
-
-                if global_step >= max_train_steps:
+            if (it + 1) % args.gradient_accumulation_steps == 0:
+                if _optimizer_step(float(loss.detach()), epoch):
                     done = True
                     break
+        else:
+            # Epoch exhausted without hitting max steps: flush a trailing
+            # partial accumulation window (batch counts can vary per epoch
+            # under token-budget batching).
+            if not done and (it + 1) % args.gradient_accumulation_steps != 0:
+                if _optimizer_step(float(loss.detach()), epoch):
+                    done = True
 
     # -- final save -----------------------------------------------------------
     merged_dir = None

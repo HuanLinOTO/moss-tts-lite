@@ -297,35 +297,47 @@ class TrainableMossTTS(nn.Module):
         if labels is not None:
             if labels.dim() != 3 or labels.shape[:2] != (bsz, seqlen):
                 raise ValueError(f"labels must be (B, T, n_vq+1), got {tuple(labels.shape)}")
-            layer_logits = [text_logits] + list(audio_logits.unbind(dim=2))
             loss, channel_losses = _multi_head_ce_loss(
-                layer_logits, labels, channelwise_loss_weight)
+                text_logits, audio_logits, labels, channelwise_loss_weight)
 
         return MossTTSTrainOutput(text_logits, audio_logits, loss, channel_losses)
 
 
 def _multi_head_ce_loss(
-    layer_logits: list[torch.Tensor],
+    text_logits: torch.Tensor,
+    audio_logits: torch.Tensor,
     labels: torch.Tensor,
     channelwise_loss_weight: Sequence[float] | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Port of MossTTSDelayModel.forward loss (modeling_moss_tts.py)."""
+    """Port of MossTTSDelayModel.forward loss (modeling_moss_tts.py).
+
+    Numerically identical to a per-head loop of F.cross_entropy: rows are
+    independent, so the 32 audio heads (shared vocab) are folded into one CE
+    call over [B * n_vq * T, V] and only the text head runs separately.
+    Cuts ~33 Python/kernel round-trips per step down to 2.
+    """
     bsz = labels.size(0)
-    n_heads = len(layer_logits)
+    n_heads = labels.size(2)
     all_token_nums = torch.sum(labels != -100, dim=1)                # [B, C]
 
-    all_sum_losses = []
-    for i, logits in enumerate(layer_logits):
-        cur_labels = labels[..., i]
-        vocab_size = logits.size(-1)
-        per_token = F.cross_entropy(
-            logits.reshape(-1, vocab_size).float(),
-            cur_labels.contiguous().view(-1),
-            reduction="none",
-        )
-        per_token = per_token.view(bsz, -1)
-        all_sum_losses.append(torch.sum(per_token, dim=-1))          # [B]
-    all_sum_losses = torch.stack(all_sum_losses, dim=1)              # [B, C]
+    text_vocab = text_logits.size(-1)
+    text_per_token = F.cross_entropy(
+        text_logits.reshape(-1, text_vocab).float(),
+        labels[..., 0].contiguous().view(-1),
+        reduction="none",
+    ).view(bsz, -1)                                                  # [B, T]
+
+    n_vq = audio_logits.size(2)
+    audio_vocab = audio_logits.size(-1)
+    audio_per_token = F.cross_entropy(
+        audio_logits.permute(0, 2, 1, 3).reshape(-1, audio_vocab).float(),
+        labels[..., 1:].permute(0, 2, 1).contiguous().view(-1),
+        reduction="none",
+    ).view(bsz, n_vq, -1)                                            # [B, C, T]
+
+    all_sum_losses = torch.cat(
+        [text_per_token.sum(dim=-1, keepdim=True),
+         audio_per_token.sum(dim=-1)], dim=1)                        # [B, C]
 
     if channelwise_loss_weight is not None:
         if len(channelwise_loss_weight) != n_heads:
