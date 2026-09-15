@@ -105,11 +105,36 @@ def loudness_normalize(wav: np.ndarray, target_dbfs: float = -20.0,
     return wav * np.float32(10.0 ** (gain / 20.0))
 
 
-def load_audio_for_codec(path: str, target_sr: int = SAMPLING_RATE) -> np.ndarray:
-    """Read + mono + resample + loudness-normalize (official preprocessing)."""
-    wav, sr = load_wav_mono(path)
-    if sr != target_sr:
-        wav = resample_sinc(wav, sr, target_sr)
+def load_wav_stereo(path: str) -> tuple[np.ndarray, int]:
+    """Read audio as float32 [C, T] with C in {1, 2} at its native rate.
+
+    Matches the v2 processor: mono is duplicated to two channels, extra
+    channels are truncated to the first two.
+    """
+    data, sr = sf.read(path, dtype="float32", always_2d=True)
+    if data.shape[1] == 1:
+        data = np.repeat(data, 2, axis=1)
+    elif data.shape[1] > 2:
+        data = data[:, :2]
+    return np.ascontiguousarray(data.T, dtype=np.float32), int(sr)
+
+
+def load_audio_for_codec(path: str, target_sr: int = SAMPLING_RATE,
+                         channels: int = 1) -> np.ndarray:
+    """Read + (mono|stereo) + resample + loudness-normalize (official path).
+
+    channels=1 keeps the v1 codec preprocessing (mono); channels=2 follows
+    the v2 (48 kHz stereo) processor.
+    """
+    if channels == 2:
+        wav, sr = load_wav_stereo(path)                     # [C, T]
+        if sr != target_sr:
+            wav = np.stack([resample_sinc(wav[c], sr, target_sr)
+                            for c in range(wav.shape[0])])
+    else:
+        wav, sr = load_wav_mono(path)
+        if sr != target_sr:
+            wav = resample_sinc(wav, sr, target_sr)
     return loudness_normalize(wav)
 
 
@@ -130,13 +155,23 @@ class CodecEncoder:
         self.model = AutoModel.from_pretrained(codec_dir, trust_remote_code=True)
         self.model.to(device).eval()
         self.device = device
+        # v1 (MOSS-Audio-Tokenizer): 24 kHz mono, n_vq 32.
+        # v2 (MOSS-Audio-Tokenizer-v2): 48 kHz stereo, TTS uses the first 12.
+        cfg_path = Path(codec_dir) / "config.json"
+        codec_cfg = json.loads(cfg_path.read_text("utf-8")) if cfg_path.exists() else {}
+        self.sampling_rate = int(codec_cfg.get("sample_rate", 24000))
+        self.channels = int(codec_cfg.get("number_channels", 1))
+        self.default_n_vq = 12 if self.channels == 2 or self.sampling_rate == 48000 else 32
 
     def encode(self, wav_list: list[np.ndarray],
                n_vq: Optional[int] = None) -> list[np.ndarray]:
         import torch
 
-        wavs = [torch.from_numpy(np.ascontiguousarray(w)).to(self.device)
-                for w in wav_list]
+        if n_vq is None:
+            n_vq = self.default_n_vq
+        # v1 path feeds [T] (mono); v2 feeds [C, T] — both as float32.
+        wavs = [torch.from_numpy(np.ascontiguousarray(w, dtype=np.float32))
+                .to(self.device) for w in wav_list]
         with torch.no_grad():
             if hasattr(self.model, "batch_encode"):
                 enc = self.model.batch_encode(wavs, num_quantizers=n_vq)
@@ -144,13 +179,13 @@ class CodecEncoder:
                 audio_codes_lengths = enc.audio_codes_lengths
             else:
                 max_len = max(int(w.shape[-1]) for w in wavs)
-                input_values = torch.zeros(len(wavs), 1, max_len,
+                input_values = torch.zeros(len(wavs), self.channels, max_len,
                                            dtype=torch.float32, device=self.device)
                 padding_mask = torch.zeros(len(wavs), max_len, dtype=torch.bool,
                                            device=self.device)
                 for i, w in enumerate(wavs):
                     this_len = int(w.shape[-1])
-                    input_values[i, 0, :this_len] = w
+                    input_values[i, :, :this_len] = w
                     padding_mask[i, :this_len] = True
                 enc = self.model.encode(input_values, padding_mask=padding_mask,
                                         num_quantizers=n_vq, return_dict=True)
@@ -195,9 +230,13 @@ def collect_paths(records: list[dict], field_name: str) -> list[str]:
 def batch_encode_paths(encoder: CodecEncoder, paths: list[str], batch_size: int,
                        n_vq: Optional[int]) -> dict[str, list[list[int]]]:
     codes: dict[str, list[list[int]]] = {}
+    if n_vq is None:
+        n_vq = encoder.default_n_vq
     for start in range(0, len(paths), batch_size):
         batch_paths = paths[start:start + batch_size]
-        encoded = encoder.encode([load_audio_for_codec(p) for p in batch_paths], n_vq)
+        encoded = encoder.encode(
+            [load_audio_for_codec(p, encoder.sampling_rate, encoder.channels)
+             for p in batch_paths], n_vq)
         for path, c in zip(batch_paths, encoded):
             codes[path] = c.astype(int).tolist()
         print(f"[prepare_data] encoded {min(start + batch_size, len(paths))}/"

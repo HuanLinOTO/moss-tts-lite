@@ -33,6 +33,7 @@ from .bpe import QwenBPE
 from .data import MossTTSTrainDataset, load_jsonl
 from .model import N_VQ
 from .nn import TrainableMossTTS
+from .nn_local import TrainableMossTTSLocal
 
 __all__ = ["main", "cmd_train", "cmd_merge", "write_safetensors"]
 
@@ -328,7 +329,11 @@ def quantize_model_4bit(model: torch.nn.Module,
             if not isinstance(child, torch.nn.Linear):
                 continue
             qualified = f"{parent_name}.{child_name}" if parent_name else child_name
-            if not qualified.startswith("language_model"):
+            # Both generations keep their qwen3 trunk under one container:
+            # language_model.* (v1 delay) / transformer.* (local-transformer).
+            # "local_transformer.*" must NOT match: it stays high-precision.
+            if not (qualified.startswith("language_model")
+                    or qualified.startswith("transformer.")):
                 continue
             weight = child.weight.data
             if target_device is not None and weight.device.type == "cpu":
@@ -542,8 +547,19 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
                    if (args.mode == "qlora" and device.type == "cuda") else device)
     print(f"[{_ts()}] loading base model from {args.model_dir} "
           f"(device={load_device}, dtype={dtype})")
-    model = TrainableMossTTS.from_pretrained(args.model_dir, dtype=dtype,
-                                             device=load_device)
+    cfg_path = Path(args.model_dir) / "config.json"
+    is_local_arch = False
+    if cfg_path.exists():
+        try:
+            is_local_arch = json.loads(
+                cfg_path.read_text("utf-8")).get("model_type") == "moss_tts_local"
+        except json.JSONDecodeError:
+            pass
+    model_cls = TrainableMossTTSLocal if is_local_arch else TrainableMossTTS
+    print(f"[{_ts()}] architecture: "
+          f"{'local-transformer (n_vq=12, 48kHz v2)' if is_local_arch else 'delay (v1)'}")
+    model = model_cls.from_pretrained(args.model_dir, dtype=dtype,
+                                      device=load_device)
     base_n_vq = model.config.n_vq
 
     if args.mode == "qlora":
