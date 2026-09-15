@@ -110,6 +110,10 @@ def build_train_parser() -> argparse.ArgumentParser:
                         "smaller batches). 0 = fixed --per-device-batch-size.")
     p.add_argument("--fused-optimizer", action="store_true",
                    help="Fused AdamW optimizer step (CUDA only).")
+    p.add_argument("--torch-compile", action="store_true",
+                   help="torch.compile the wrapped model (experimental with "
+                        "NF4/peft; try with --max-batch-tokens for stable "
+                        "shapes).")
     return p
 
 
@@ -589,6 +593,10 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         model.gradient_checkpointing_enable()
         print(f"[{_ts()}] gradient checkpointing enabled")
 
+    if args.torch_compile:
+        model = torch.compile(model, dynamic=True)
+        print(f"[{_ts()}] torch.compile enabled (dynamic=True)")
+
     n_heads = 1 + base_n_vq
     channelwise = parse_channelwise_loss_weight(args.channelwise_loss_weight, n_heads)
     print(f"[{_ts()}] channelwise_loss_weight={channelwise}")
@@ -635,7 +643,10 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
 
     def _save_adapter(step_dir: Path) -> None:
         step_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(str(step_dir))
+        # torch.compile wraps the model in OptimizedModule; peft's
+        # save_pretrained lives on the original module.
+        target = getattr(model, "_orig_mod", model)
+        target.save_pretrained(str(step_dir))
         with open(step_dir / "train_args.json", "w", encoding="utf-8") as f:
             json.dump(train_args, f, indent=2, ensure_ascii=False)
 
