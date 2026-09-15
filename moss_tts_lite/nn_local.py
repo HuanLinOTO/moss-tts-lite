@@ -285,9 +285,11 @@ class TrainableMossTTSLocal(nn.Module):
             raise ValueError(
                 f"input_ids must be (B, T, {cfg.n_vq + 1}), got {tuple(input_ids.shape)}")
         bsz, seqlen, _ = input_ids.shape
+        # RoPE tables in the embedding dtype: fp32 tables would upcast q/k
+        # past the (bf16) value tensor and break SDPA (same as the v1 path).
         cos, sin = rope_tables(
             seqlen, cfg.head_dim, cfg.rope_theta, input_ids.device,
-            torch.float32)
+            self.transformer.embed_tokens.weight.dtype)
         attn_mask = TrainableMossTTS._build_attn_bias(
             attention_mask, seqlen, input_ids.device)
 
