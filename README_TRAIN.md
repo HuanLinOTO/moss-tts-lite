@@ -120,6 +120,42 @@ bs4 随机组批会 OOM）。三个正交手段：
 瓶颈是 per-step Python/launch 开销（peft 包装层 ~400 次调用/步），
 batch 越大摊得越薄。
 
+### 3.2 MOSS-TTS-Local-Transformer-v1.5(48kHz v2 codec)
+
+同一套 CLI 直接支持 HF 版 OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5
+(config.json 的 model_type == "moss_tts_local"，自动切换模型类与数据布局):
+
+```bash
+python -m moss_tts_lite.prepare_data \
+    --codec-dir /path/to/MOSS-Audio-Tokenizer-v2 \
+    --input-jsonl data/nahida_raw.jsonl \
+    --output-jsonl data/nahida_train_v2.jsonl \
+    --device cuda --batch-size 4        # 自动 48kHz 立体声、n_vq=12
+
+python -m moss_tts_lite.train \
+    --model-dir /path/to/MOSS-TTS-Local-Transformer-v1.5 \
+    --train-jsonl data/nahida_train_v2.jsonl \
+    --output-dir runs/nahida-v2-qlora \
+    --mode qlora --bf16 --per-device-batch-size 4 \
+    --max-batch-tokens 900 --num-workers 4 --fused-optimizer \
+    --num-epochs 3 --seed 42
+```
+
+与 v1(ModelScope 版)的关键差异(均已自动处理):
+
+| | v1(delay) | v2(local-transformer) |
+|---|---|---|
+| 采样率/声道 | 24kHz 单声道 | **48kHz 立体声** |
+| n_vq | 32 | **12** |
+| audio_start/end id | 151652/151653 | **151669/151670**(从 tokenizer 解析) |
+| slot token | 专用字符串 | **复用 vision_pad/video_pad 的 id**(按 config 注入) |
+| 音频帧展开 | delay 模式,每帧 n_vq 个位置 | **每帧 1 个位置**(序列短 ~8x) |
+| loss | 逐样本逐通道归一 | batch 级加权均值 + binary local text head |
+
+v2 序列短(1705 条数据 p50=149 / p95=233 / max=426 token),token 预算可以
+开得比 v1 更激进;共享 4090(~14GB 可用)实测 bs4+mbt900 约 11.2 samples/s,
+峰值 12.6GB。merge 子命令同样自动识别 v2 底座。
+
 ## 4. 合并导出：merge（独立入口）
 
 ```bash
