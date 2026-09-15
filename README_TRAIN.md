@@ -153,8 +153,17 @@ python -m moss_tts_lite.train \
 | loss | 逐样本逐通道归一 | batch 级加权均值 + binary local text head |
 
 v2 序列短(1705 条数据 p50=149 / p95=233 / max=426 token),token 预算可以
-开得比 v1 更激进;共享 4090(~14GB 可用)实测 bs4+mbt900 约 11.2 samples/s,
-峰值 12.6GB。merge 子命令同样自动识别 v2 底座。
+开得比 v1 更激进。共享 4090(~14.7GB 可用)实测:
+
+| 配置 | samples/s | 峰值显存 |
+|---|---|---|
+| bs4 + mbt900 (rank32) | 11.2 | 12.6 GB |
+| bs8 + mbt900 (rank64) | ~16 | 13.3 GB |
+| bs8 + mbt1200 (rank64) | OOM(差 1.7GB) | - |
+
+注: torch.compile(dynamic=True) 在 NF4+peft 下实测负优化(1.9 vs 2.8 steps/s,
+bnb4bit graph break + 动态 shape 重编译),保持默认关闭。merge 子命令同样
+自动识别 v2 底座。
 
 ## 4. 合并导出：merge（独立入口）
 
