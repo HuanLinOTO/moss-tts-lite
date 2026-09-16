@@ -376,9 +376,11 @@ class TrainableMossTTSLocal(nn.Module):
         # -- teacher embeddings for all codebooks in one gather
         valid = (audio_targets >= 0) & (audio_targets < emb_table.shape[1])
         safe = audio_targets.clamp(min=0)                     # [N, n_vq]
-        idx = safe.t().unsqueeze(-1).expand(-1, -1, hidden)   # [n_vq, N, H]
-        emb = emb_table.to(dtype=local_dtype).gather(1, idx)  # [n_vq, N, H]
-        emb = emb * valid.t().unsqueeze(-1).to(emb.dtype)
+        # teacher embeddings use only the first n_vq-1 codebooks:
+        # the last codebook is a pure prediction target (see looped path)
+        idx = safe.t()[:n_vq - 1].unsqueeze(-1).expand(-1, -1, hidden)
+        emb = emb_table[:n_vq - 1].to(dtype=local_dtype).gather(1, idx)
+        emb = emb * valid.t()[:n_vq - 1].unsqueeze(-1).to(emb.dtype)
         local_inputs = prefix.new_zeros(n_tokens, n_vq, hidden)
         local_inputs[:, 0, :] = prefix
         local_inputs[:, 1:, :] = emb.permute(1, 0, 2)
