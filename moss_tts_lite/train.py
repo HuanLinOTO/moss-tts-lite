@@ -30,6 +30,8 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
+
+from .model import AUDIO_PAD_CODE
 from torch.utils.data import DataLoader
 
 from .bpe import QwenBPE
@@ -113,6 +115,10 @@ def build_train_parser() -> argparse.ArgumentParser:
                         "smaller batches). 0 = fixed --per-device-batch-size.")
     p.add_argument("--fused-optimizer", action="store_true",
                    help="Fused AdamW optimizer step (CUDA only).")
+    p.add_argument("--cuda-graph", action="store_true",
+                   help="capture fwd+bwd into per-shape CUDA graphs (single-GPU, "
+                        "no DDP; bucket-pads sequences to 64-token multiples, "
+                        "pad rows/positions are loss-ignored)")
     p.add_argument("--torch-compile", action="store_true",
                    help="torch.compile the wrapped model (experimental with "
                         "NF4/peft; try with --max-batch-tokens for stable "
@@ -713,6 +719,13 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
           f"optimizer_steps/epoch={update_steps_per_epoch} "
           f"max_train_steps={max_train_steps}")
 
+    # --- CUDA graph fast path (single GPU) --------------------------------
+    graph_mode = (args.cuda_graph and device.type == "cuda" and not ddp_on
+                  and not args.torch_compile)
+    if args.cuda_graph and not graph_mode:
+        print(f"[{_ts()}] --cuda-graph ignored (requires single-GPU, no DDP, "
+              f"no torch.compile)", flush=True)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     train_args = {k: v for k, v in vars(args).items() if k != "command"}
@@ -723,7 +736,8 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
                        "n_vq": n_heads - 1,
                        "torch_dtype": str(dtype).replace("torch.", ""),
                        "moss_tts_lite_train_version": 1,
-                       "world_size": world_size})
+                       "world_size": world_size,
+                       "cuda_graph": bool(graph_mode)})
     if rank == 0:
         with open(output_dir / "train_args.json", "w", encoding="utf-8") as f:
             json.dump(train_args, f, indent=2, ensure_ascii=False)
@@ -752,7 +766,7 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
             torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
         optimizer.step()
         scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=not graph_mode)
         global_step += 1
         losses.append(micro_loss * args.gradient_accumulation_steps)
 
@@ -788,6 +802,94 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         return bool(flag.item())
 
+    class _GraphRunner:
+        """Per-(batch, T-bucket) CUDA graphs capturing fwd+bwd, shared pool.
+
+        Bucket-pads sequences to 64-token multiples; padded positions carry
+        -100 labels and masked attention so the loss is unchanged up to
+        fp reduction order. Grad scaling for accumulation is baked into the
+        captured backward via a fixed seed tensor. Shapes beyond max_graphs
+        fall back to eager. Requires zero_grad(set_to_none=False) while
+        active so captured grad buffers stay alive.
+        """
+
+        def __init__(self, call, accum: int):
+            self.call = call
+            self.accum = max(accum, 1)
+            self.pool = torch.cuda.graph_pool_handle()
+            self.graphs: dict = {}
+            self.max_graphs = 24
+            self.last_loss = None
+
+        def _tb(self, T: int) -> int:
+            return (T + 63) // 64 * 64
+
+        def _pad(self, batch):
+            ids, mask, lab = (batch["input_ids"], batch["attention_mask"],
+                              batch["labels"])
+            B, T, C = ids.shape
+            TB = self._tb(T)
+            o_ids = torch.full((B, TB, C), AUDIO_PAD_CODE, dtype=ids.dtype,
+                               device=device)
+            o_ids[:, TB - T:] = ids
+            o_mask = torch.zeros(B, TB, dtype=mask.dtype, device=device)
+            o_mask[:, TB - T:] = mask
+            o_lab = torch.full((B, TB, C), -100, dtype=lab.dtype, device=device)
+            o_lab[:, TB - T:] = lab
+            return o_ids, o_mask, o_lab
+
+        def _build(self, batch):
+            key = (batch["input_ids"].shape[0],
+                   self._tb(batch["input_ids"].shape[1]))
+            B, TB, C = key[0], key[1], batch["input_ids"].shape[2]
+            s_ids = torch.zeros(B, TB, C, dtype=torch.long, device=device)
+            s_mask = torch.zeros(B, TB, dtype=torch.bool, device=device)
+            s_lab = torch.full((B, TB, C), -100, dtype=torch.long, device=device)
+            st = torch.cuda.Stream()
+            st.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(st):
+                for _ in range(3):
+                    i, m, l = self._pad(batch)
+                    (self.call(i, m, l).loss / self.accum).backward()
+                optimizer.zero_grad(set_to_none=False)
+            torch.cuda.current_stream().wait_stream(st)
+            g = torch.cuda.CUDAGraph()
+            grad_seed = torch.full((), 1.0 / self.accum, dtype=torch.float32,
+                                   device=device)
+            optimizer.zero_grad(set_to_none=False)
+            with torch.cuda.graph(g, pool=self.pool):
+                static_loss = self.call(s_ids, s_mask, s_lab).loss
+                static_loss.backward(gradient=grad_seed)
+            self.graphs[key] = (g, s_ids, s_mask, s_lab, static_loss)
+            print(f"[{_ts()}] cuda graph captured: B={key[0]} T_bucket={key[1]} "
+                  f"({len(self.graphs)}/{self.max_graphs})", flush=True)
+            return self.graphs[key]
+
+        def step(self, batch) -> None:
+            key = (batch["input_ids"].shape[0],
+                   self._tb(batch["input_ids"].shape[1]))
+            entry = self.graphs.get(key)
+            if entry is None and len(self.graphs) < self.max_graphs:
+                entry = self._build(batch)
+            if entry is None:
+                out = self.call(batch["input_ids"], batch["attention_mask"],
+                                batch["labels"])
+                (out.loss / self.accum).backward()
+                self.last_loss = out.loss.detach()
+                return
+            g, s_ids, s_mask, s_lab, static_loss = entry
+            i, m, l = self._pad(batch)
+            s_ids.copy_(i); s_mask.copy_(m); s_lab.copy_(l)
+            g.replay()
+            self.last_loss = static_loss
+
+    graph_runner = None
+    if graph_mode:
+        def _graph_call(ids, mask, lab):
+            return runner(input_ids=ids, attention_mask=mask, labels=lab,
+                          channelwise_loss_weight=channelwise)
+        graph_runner = _GraphRunner(_graph_call, args.gradient_accumulation_steps)
+
     for epoch in range(args.num_epochs):
         if done:
             break
@@ -799,15 +901,20 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
                         if ddp_on and not boundary
                         else contextlib.nullcontext())
             with sync_ctx:
-                out = runner(input_ids=batch["input_ids"],
-                             attention_mask=batch["attention_mask"],
-                             labels=batch["labels"],
-                             channelwise_loss_weight=channelwise)
-                loss = out.loss / args.gradient_accumulation_steps
-                loss.backward()
+                if graph_runner is not None:
+                    graph_runner.step(batch)
+                    micro_raw = graph_runner.last_loss
+                else:
+                    out = runner(input_ids=batch["input_ids"],
+                                 attention_mask=batch["attention_mask"],
+                                 labels=batch["labels"],
+                                 channelwise_loss_weight=channelwise)
+                    loss = out.loss / args.gradient_accumulation_steps
+                    loss.backward()
+                    micro_raw = out.loss
 
             if boundary:
-                if _sync_done(_optimizer_step(float(loss.detach()), epoch)):
+                if _sync_done(_optimizer_step(float(micro_raw.detach()) / args.gradient_accumulation_steps, epoch)):
                     done = True
                     break
         else:
@@ -815,7 +922,7 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
             # partial accumulation window (batch counts can vary per epoch
             # under token-budget batching).
             if not done and (it + 1) % args.gradient_accumulation_steps != 0:
-                if _sync_done(_optimizer_step(float(loss.detach()), epoch)):
+                if _sync_done(_optimizer_step(float(micro_raw.detach()) / args.gradient_accumulation_steps, epoch)):
                     done = True
 
     # -- final save -----------------------------------------------------------

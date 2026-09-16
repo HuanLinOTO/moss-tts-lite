@@ -418,15 +418,22 @@ class TrainableMossTTSLocal(nn.Module):
         a_valid = audio_targets.t() != -100                   # [n_vq, N]
         a_counts = a_valid.sum(dim=1)                         # [n_vq]
         a_ce = ce_all.sum(dim=1) / a_counts.clamp(min=1).float()
-        w_vec = torch.tensor([weights[c + 1] for c in range(n_vq)],
-                             device=device, dtype=torch.float32)
+        # Constant tensors are cached: rebuilding them every step does a
+        # pageable H2D copy, which is illegal inside CUDA graph capture.
+        key = (tuple(weights), device)
+        cached = getattr(self, "_loss_const_cache", None)
+        if cached is None or cached[0] != key:
+            w_vec = torch.tensor([weights[c + 1] for c in range(n_vq)],
+                                 device=device, dtype=torch.float32)
+            w0 = torch.full((), weights[0], device=device,
+                            dtype=torch.float32)
+            self._loss_const_cache = (key, w_vec, w0)
+        else:
+            _, w_vec, w0 = cached
         total = total + (w_vec * a_ce).sum()
         per_channel[1:] = a_ce.detach()
 
-        denom = torch.where(has_text,
-                            torch.full((), weights[0], device=device,
-                                       dtype=torch.float32),
-                            zero) \
+        denom = torch.where(has_text, w0, zero) \
             + (w_vec * (a_counts > 0).to(torch.float32)).sum()
         total = total / denom.clamp(min=1e-6)
         return total, per_channel

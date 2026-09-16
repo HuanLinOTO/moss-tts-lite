@@ -355,12 +355,20 @@ class MossTTSTrainDataset(Dataset):
         self.tokenizer = tokenizer
         self.n_vq = n_vq
         self.slot_ids = slot_ids
+        # pack_record re-tokenizes the whole record (BPE + delay pattern);
+        # caching by index turns per-epoch repeated packing into a dict hit.
+        self._pack_cache: dict[int, dict[str, torch.Tensor]] = {}
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        return self.pack_record(self.records[index])
+        cached = self._pack_cache.get(index)
+        if cached is None:
+            cached = self.pack_record(self.records[index])
+            if len(self._pack_cache) < 65536:
+                self._pack_cache[index] = cached
+        return cached
 
     def pack_record(self, record: dict[str, Any]) -> dict[str, torch.Tensor]:
         if "audio_codes" not in record:

@@ -223,7 +223,7 @@ class MossBackbone(nn.Module):
             if gradient_checkpointing and self.training:
                 h = torch.utils.checkpoint.checkpoint(
                     layer, h, attn_bias["cos"], attn_bias["sin"], attn_bias["mask"],
-                    use_reentrant=False)
+                    use_reentrant=False, preserve_rng_state=False)
             else:
                 h = layer(h, attn_bias["cos"], attn_bias["sin"], attn_bias["mask"])
         return self.norm(h)
