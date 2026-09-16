@@ -311,6 +311,130 @@ class TrainableMossTTSLocal(nn.Module):
         labels: torch.Tensor,                  # [B, T, n_vq+1]
         channelwise_loss_weight: Sequence[float] | None,
     ):
+        """Dispatcher: vectorized fast path when codebook tables are frozen
+        (LoRA/QLoRA training); original looped path otherwise (full FT)."""
+        tables = getattr(self, "_loss_tables_cache", None)
+        if tables is None:
+            frozen = (
+                not any(e.weight.requires_grad
+                        for e in self.audio_embeddings)
+                and not any(h.weight.requires_grad
+                            for h in self.audio_lm_heads))
+            if frozen:
+                tables = (
+                    torch.stack([e.weight for e in self.audio_embeddings]
+                                ).detach(),
+                    torch.stack([h.weight for h in self.audio_lm_heads]
+                                ).detach(),
+                    True)
+            else:
+                tables = (None, None, False)
+            self._loss_tables_cache = tables
+        if tables[2] and tables[0] is not None:
+            return self._local_loss_vectorized(
+                global_hidden, labels, channelwise_loss_weight, tables)
+        return self._local_loss_looped(
+            global_hidden, labels, channelwise_loss_weight)
+
+    def _local_loss_vectorized(
+        self,
+        global_hidden: torch.Tensor,           # [B, T, H]
+        labels: torch.Tensor,                  # [B, T, n_vq+1]
+        channelwise_loss_weight: Sequence[float] | None,
+        tables,
+    ):
+        """Vectorized fast path: one gather + one bmm + batched CE.
+
+        Numerically equivalent to _local_loss_looped (per-channel mean over
+        valid targets) without per-codebook python loops or GPU->CPU
+        `.any()` sync points. Requires the frozen stacked tables.
+        """
+        cfg = self.config
+        bsz, seqlen, hidden = global_hidden.shape
+        n_vq = cfg.n_vq
+        if labels.shape[-1] != n_vq + 1:
+            raise ValueError(f"labels must have {n_vq + 1} channels")
+        weights = list(channelwise_loss_weight) if channelwise_loss_weight \
+            else [1.0] * (n_vq + 1)
+        if len(weights) != n_vq + 1:
+            raise ValueError(f"channelwise weights length {len(weights)} "
+                             f"!= {n_vq + 1}")
+        emb_table, head_table, _ = tables
+
+        flat_hidden = global_hidden.reshape(bsz * seqlen, hidden)
+        flat_labels = labels.reshape(bsz * seqlen, n_vq + 1)
+        local_dtype = self.local_transformer.ln_f.weight.dtype
+        device = flat_hidden.device
+        n_tokens = flat_hidden.shape[0]
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        per_channel = torch.zeros(n_vq + 1, device=device,
+                                  dtype=torch.float32)
+
+        prefix = flat_hidden.to(dtype=local_dtype)
+        audio_targets = flat_labels[:, 1:]                    # [N, n_vq]
+
+        # -- teacher embeddings for all codebooks in one gather
+        valid = (audio_targets >= 0) & (audio_targets < emb_table.shape[1])
+        safe = audio_targets.clamp(min=0)                     # [N, n_vq]
+        idx = safe.t().unsqueeze(-1).expand(-1, -1, hidden)   # [n_vq, N, H]
+        emb = emb_table.to(dtype=local_dtype).gather(1, idx)  # [n_vq, N, H]
+        emb = emb * valid.t().unsqueeze(-1).to(emb.dtype)
+        local_inputs = prefix.new_zeros(n_tokens, n_vq, hidden)
+        local_inputs[:, 0, :] = prefix
+        local_inputs[:, 1:, :] = emb.permute(1, 0, 2)
+
+        local_hidden = self.local_transformer(local_inputs)   # [N, n_vq, H]
+
+        # -- text head (model-structure branch only; no data-dependent sync)
+        text_targets = flat_labels[:, 0]
+        if self.use_binary_local_text_head and self.local_text_lm_head is not None \
+                and self.audio_assistant_slot_token_id >= 0:
+            t_logits = self.local_text_lm_head(local_hidden[:, 0, :])
+            t_targets = torch.full_like(text_targets, -100)
+            t_targets = t_targets.masked_fill(
+                text_targets.eq(self.audio_assistant_slot_token_id), 0)
+            t_targets = t_targets.masked_fill(
+                text_targets.eq(self.audio_end_token_id), 1)
+        else:
+            t_logits = self.text_lm_head(local_hidden[:, 0, :])
+            t_targets = text_targets
+        t_valid = t_targets != -100
+        t_ce = (F.cross_entropy(t_logits.float(), t_targets,
+                                ignore_index=-100, reduction="sum")
+                / t_valid.sum().clamp(min=1).float())
+        has_text = t_valid.any()
+        total = torch.where(has_text, weights[0] * t_ce, zero)
+        per_channel[0] = torch.where(has_text, t_ce.detach(), zero)
+
+        # -- audio heads: one bmm + one batched CE
+        lh = local_hidden.permute(1, 0, 2)                    # [n_vq, N, H]
+        logits = torch.bmm(lh, head_table.to(dtype=lh.dtype).transpose(1, 2))
+        ce_all = F.cross_entropy(
+            logits.float().flatten(0, 1),
+            audio_targets.t().reshape(-1),
+            ignore_index=-100, reduction="none").reshape(n_vq, n_tokens)
+        a_valid = audio_targets.t() != -100                   # [n_vq, N]
+        a_counts = a_valid.sum(dim=1)                         # [n_vq]
+        a_ce = ce_all.sum(dim=1) / a_counts.clamp(min=1).float()
+        w_vec = torch.tensor([weights[c + 1] for c in range(n_vq)],
+                             device=device, dtype=torch.float32)
+        total = total + (w_vec * a_ce).sum()
+        per_channel[1:] = a_ce.detach()
+
+        denom = torch.where(has_text,
+                            torch.full((), weights[0], device=device,
+                                       dtype=torch.float32),
+                            zero) \
+            + (w_vec * (a_counts > 0).to(torch.float32)).sum()
+        total = total / denom.clamp(min=1e-6)
+        return total, per_channel
+
+    def _local_loss_looped(
+        self,
+        global_hidden: torch.Tensor,           # [B, T, H]
+        labels: torch.Tensor,                  # [B, T, n_vq+1]
+        channelwise_loss_weight: Sequence[float] | None,
+    ):
         """Port of finetuning/sft.py compute_supervised_loss_from_hidden."""
         cfg = self.config
         bsz, seqlen, hidden = global_hidden.shape
