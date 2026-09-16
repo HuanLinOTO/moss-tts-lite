@@ -22,6 +22,23 @@ from .st_loader import read_safetensors
 
 __all__ = ["MossTTSConfig", "TrainableMossTTS", "MossTTSTrainOutput"]
 
+# --- optional LigerKernel fused ops (RMSNorm / RoPE / SiLU-mul / add+RMSNorm) --
+# Enable with env MOSS_LIGER=1 (initial value) or by flipping moss_tts_lite.nn
+# .LIGER_ENABLED at runtime. Falls back silently to the reference path when
+# liger-kernel is not installed. Semantics: llama casting mode (fp32 stats,
+# cast back, then weight scale), rotate_half rope, all with autograd support.
+LIGER_ENABLED = __import__("os").environ.get("MOSS_LIGER", "0") == "1"
+
+
+def _liger_ok(x: torch.Tensor) -> bool:
+    if not (LIGER_ENABLED and x.is_cuda):
+        return False
+    try:
+        import liger_kernel  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
 
 @dataclass
 class MossTTSConfig:
@@ -73,6 +90,10 @@ class MossRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _liger_ok(x):
+            from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+            return LigerRMSNormFunction.apply(x, self.weight, self.eps,
+                                              0.0, "llama", True)
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -122,8 +143,16 @@ class MossAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        q = q * cos + _rotate_half(q) * sin
-        k = k * cos + _rotate_half(k) * sin
+        if _liger_ok(q):
+            from liger_kernel.ops.rope import LigerRopeFunction
+            # cos/sin arrive as [1, 1, T, D]; liger wants [1, T, D] and
+            # only reads the left half -- cat(freqs, freqs) tables satisfy it.
+            q, k = LigerRopeFunction.apply(
+                q, k, cos.reshape(1, -1, cos.shape[-1]),
+                sin.reshape(1, -1, sin.shape[-1]))
+        else:
+            q = q * cos + _rotate_half(q) * sin
+            k = k * cos + _rotate_half(k) * sin
 
         rep = cfg.n_heads // cfg.n_kv_heads
         if rep > 1:
@@ -143,7 +172,12 @@ class MossMLP(nn.Module):
         self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        g = self.gate_proj(x)
+        u = self.up_proj(x)
+        if _liger_ok(g):
+            from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+            return self.down_proj(LigerSiLUMulFunction.apply(g, u))
+        return self.down_proj(F.silu(g) * u)
 
 
 class MossDecoderLayer(nn.Module):
@@ -158,6 +192,15 @@ class MossDecoderLayer(nn.Module):
                 attn_bias: torch.Tensor) -> torch.Tensor:
         residual = h
         h = self.self_attn(self.input_layernorm(h), cos, sin, attn_bias)
+        if _liger_ok(h):
+            # h = residual + attn_out, then RMSNorm -- one kernel, and the
+            # updated residual (sum) comes back as the second output.
+            from liger_kernel.ops.fused_add_rms_norm import (
+                LigerFusedAddRMSNormFunction)
+            h, residual = LigerFusedAddRMSNormFunction.apply(
+                h, residual, self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps)
+            return residual + self.mlp(h)
         h = residual + h
         residual = h
         h = self.mlp(self.post_attention_layernorm(h))
