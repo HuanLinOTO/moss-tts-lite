@@ -25,7 +25,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
+import contextlib
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
@@ -512,6 +515,47 @@ class TokenBudgetBatchSampler:
         return len(self._compose())
 
 
+class RankBatchSampler:
+    """DDP wrapper: re-compose the base plan each epoch, keep rank::world slices.
+
+    Batch-level interleaving (not sample-level) preserves the base sampler's
+    length-grouped batches; ranks see near-equal batch counts and length
+    distributions.
+    """
+
+    def __init__(self, base, rank, world_size):
+        self.base = base
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        batches = self.base._compose()
+        self.base.epoch += 1
+        # Equal batch counts on every rank (floor division, drop the
+        # remainder): keeps optimizer-step boundaries aligned so DDP
+        # allreduces always pair up. ~0.3% of batches are dropped per epoch.
+        n_per_rank = len(batches) // self.world_size
+        start = self.rank * n_per_rank
+        return iter(batches[start:start + n_per_rank])
+
+    def __len__(self) -> int:
+        return len(self.base) // self.world_size
+
+
+def _init_distributed() -> tuple[int, int, int, bool]:
+    """Join the NCCL process group when launched under torchrun.
+
+    Returns (rank, local_rank, world_size, enabled).
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return 0, 0, 1, False
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank % world_size)))
+    return rank, local_rank, world_size, True
+
+
 # ---------------------------------------------------------------------------
 # train
 # ---------------------------------------------------------------------------
@@ -522,7 +566,13 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-    device = resolve_device(args.device)
+    rank, local_rank, world_size, ddp_on = _init_distributed()
+    if ddp_on:
+        # torchrun owns device placement; --device would collide across ranks.
+        device = torch.device(f"cuda:{local_rank}")
+        print(f"[{_ts()}] DDP enabled: rank={rank}/{world_size} device={device}")
+    else:
+        device = resolve_device(args.device)
     if args.mode == "qlora" and device.type != "cuda":
         raise SystemExit("--mode qlora needs CUDA (bitsandbytes 4-bit); "
                          "use --mode lora for CPU testing.")
@@ -584,8 +634,13 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0)
     if batch_sampler is not None:
+        if ddp_on:
+            batch_sampler = RankBatchSampler(batch_sampler, rank, world_size)
         loader = DataLoader(dataset, batch_sampler=batch_sampler, **loader_kwargs)
     else:
+        if ddp_on:
+            raise SystemExit("DDP requires --max-batch-tokens > 0 "
+                             "(token-budget batching).")
         loader = DataLoader(dataset, batch_size=args.per_device_batch_size,
                             shuffle=True,
                             generator=torch.Generator().manual_seed(args.seed),
@@ -619,6 +674,17 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         # PeftModel delegates unknown attributes to the wrapped base model.
         model.gradient_checkpointing_enable()
         print(f"[{_ts()}] gradient checkpointing enabled")
+
+    runner = model
+    if ddp_on:
+        if args.torch_compile:
+            raise SystemExit("--torch-compile with DDP is not supported; "
+                             "drop one of them.")
+        # Only requires_grad params (LoRA adapters) join the DDP buckets;
+        # frozen NF4/base weights are never synchronized.
+        runner = DDP(model, device_ids=[local_rank])
+        n_sync = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[{_ts()}] DDP wrapped: {n_sync:,} trainable params in buckets")
 
     if args.torch_compile:
         model = torch.compile(model, dynamic=True)
@@ -656,9 +722,11 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
                        "warmup_steps": warmup_steps,
                        "n_vq": n_heads - 1,
                        "torch_dtype": str(dtype).replace("torch.", ""),
-                       "moss_tts_lite_train_version": 1})
-    with open(output_dir / "train_args.json", "w", encoding="utf-8") as f:
-        json.dump(train_args, f, indent=2, ensure_ascii=False)
+                       "moss_tts_lite_train_version": 1,
+                       "world_size": world_size})
+    if rank == 0:
+        with open(output_dir / "train_args.json", "w", encoding="utf-8") as f:
+            json.dump(train_args, f, indent=2, ensure_ascii=False)
 
     model.train()
     global_step = 0
@@ -689,7 +757,7 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
         losses.append(micro_loss * args.gradient_accumulation_steps)
 
         now = time.perf_counter()
-        if global_step % args.logging_steps == 0:
+        if rank == 0 and global_step % args.logging_steps == 0:
             steps_per_sec = max(global_step - last_logged_step, 1) / (now - last_log)
             eta = (max_train_steps - global_step) / steps_per_sec
             mem = (torch.cuda.max_memory_allocated() / 2**30
@@ -702,7 +770,7 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
             last_log = now
             last_logged_step = global_step
 
-        if args.save_steps and global_step % args.save_steps == 0:
+        if rank == 0 and args.save_steps and global_step % args.save_steps == 0:
             if args.mode in ("lora", "qlora"):
                 _save_adapter(output_dir / f"checkpoint-{global_step}")
             else:
@@ -712,21 +780,34 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
 
         return global_step >= max_train_steps
 
+    def _sync_done(local_done: bool) -> bool:
+        """OR-reduce the max-steps flag across ranks (deadlock guard)."""
+        if not ddp_on:
+            return local_done
+        flag = torch.tensor(int(local_done), dtype=torch.int64, device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
     for epoch in range(args.num_epochs):
         if done:
             break
         for it, batch in enumerate(loader):
             batch = {k: v.to(device, non_blocking=True)
                      for k, v in batch.items()}
-            out = model(input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        labels=batch["labels"],
-                        channelwise_loss_weight=channelwise)
-            loss = out.loss / args.gradient_accumulation_steps
-            loss.backward()
+            boundary = (it + 1) % args.gradient_accumulation_steps == 0
+            sync_ctx = (runner.no_sync()
+                        if ddp_on and not boundary
+                        else contextlib.nullcontext())
+            with sync_ctx:
+                out = runner(input_ids=batch["input_ids"],
+                             attention_mask=batch["attention_mask"],
+                             labels=batch["labels"],
+                             channelwise_loss_weight=channelwise)
+                loss = out.loss / args.gradient_accumulation_steps
+                loss.backward()
 
-            if (it + 1) % args.gradient_accumulation_steps == 0:
-                if _optimizer_step(float(loss.detach()), epoch):
+            if boundary:
+                if _sync_done(_optimizer_step(float(loss.detach()), epoch)):
                     done = True
                     break
         else:
@@ -734,29 +815,33 @@ def cmd_train(args: argparse.Namespace) -> dict[str, Any]:
             # partial accumulation window (batch counts can vary per epoch
             # under token-budget batching).
             if not done and (it + 1) % args.gradient_accumulation_steps != 0:
-                if _optimizer_step(float(loss.detach()), epoch):
+                if _sync_done(_optimizer_step(float(loss.detach()), epoch)):
                     done = True
 
     # -- final save -----------------------------------------------------------
     merged_dir = None
-    if args.mode in ("lora", "qlora"):
-        _save_adapter(output_dir)
-        print(f"[{_ts()}] saved adapter to {output_dir}")
-        if args.merge_and_export:
-            merged_dir = output_dir / "merged"
-            if args.mode == "qlora":
-                dequantize_model_4bit(model)
-            merged = model.merge_and_unload()
-            export_model_dir(merged, args.model_dir, merged_dir, dtype=dtype)
-            del merged
-            print(f"[{_ts()}] merged export saved to {merged_dir}")
-    else:
-        written = export_model_dir(model, args.model_dir, output_dir, dtype=dtype)
-        print(f"[{_ts()}] saved full model: {', '.join(written)}")
+    if rank == 0:
+        if args.mode in ("lora", "qlora"):
+            _save_adapter(output_dir)
+            print(f"[{_ts()}] saved adapter to {output_dir}")
+            if args.merge_and_export:
+                merged_dir = output_dir / "merged"
+                if args.mode == "qlora":
+                    dequantize_model_4bit(model)
+                merged = model.merge_and_unload()
+                export_model_dir(merged, args.model_dir, merged_dir, dtype=dtype)
+                del merged
+                print(f"[{_ts()}] merged export saved to {merged_dir}")
+        else:
+            written = export_model_dir(model, args.model_dir, output_dir, dtype=dtype)
+            print(f"[{_ts()}] saved full model: {', '.join(written)}")
 
     elapsed = time.perf_counter() - start_time
-    print(f"[{_ts()}] finished: steps={global_step} elapsed={_fmt_duration(elapsed)} "
+    print(f"[{_ts()}] rank={rank} finished: steps={global_step} elapsed={_fmt_duration(elapsed)} "
           f"final_loss={losses[-1] if losses else float('nan'):.4f}")
+    if ddp_on:
+        dist.barrier()
+        dist.destroy_process_group()
     return {"steps": global_step, "losses": losses, "output_dir": str(output_dir),
             "merged_dir": str(merged_dir) if merged_dir else None}
 
